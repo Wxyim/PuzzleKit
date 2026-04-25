@@ -38,6 +38,7 @@ import (
 	"github.com/SUDOKU-ASCII/sudoku/pkg/logx"
 	"github.com/SUDOKU-ASCII/sudoku/pkg/obfs/httpmask"
 	"github.com/SUDOKU-ASCII/sudoku/pkg/obfs/sudoku"
+	"golang.org/x/net/proxy"
 )
 
 // logUserInfo logs an info message, prepending [User:hash] when userHash is non-empty.
@@ -54,6 +55,27 @@ func logUserWarn(tag, userHash, format string, args ...interface{}) {
 		format = "[User:" + userHash + "] " + format
 	}
 	logx.Warnf(tag, format, args...)
+}
+
+// getOutboundDialer returns a proxy.Dialer based on the configuration.
+// It falls back to direct dialing if no outbound proxy is configured.
+func getOutboundDialer(cfg *config.Config) (proxy.Dialer, error) {
+	baseDialer := &net.Dialer{Timeout: 10 * time.Second}
+
+	if cfg.Proxy == nil || strings.TrimSpace(cfg.Proxy.Address) == "" {
+		return baseDialer, nil
+	}
+
+	var auth *proxy.Auth
+	if strings.TrimSpace(cfg.Proxy.Username) != "" || strings.TrimSpace(cfg.Proxy.Password) != "" {
+		auth = &proxy.Auth{User: cfg.Proxy.Username, Password: cfg.Proxy.Password}
+	}
+
+	dialer, err := proxy.SOCKS5("tcp", strings.TrimSpace(cfg.Proxy.Address), auth, baseDialer)
+	if err != nil {
+		return nil, fmt.Errorf("failed to setup outbound SOCKS5 proxy %s: %w", cfg.Proxy.Address, err)
+	}
+	return dialer, nil
 }
 
 func RunServer(cfg *config.Config, tables []*sudoku.Table) {
@@ -242,7 +264,12 @@ func handleSudokuServerConn(handshakeConn net.Conn, rawConn net.Conn, cfg *confi
 
 		logUserInfo("Server", userHash, "Connecting to %s", destAddrStr)
 
-		target, err := net.DialTimeout("tcp", destAddrStr, 10*time.Second)
+		dialer, err := getOutboundDialer(cfg)
+		if err != nil {
+			logx.Warnf("Server", "Outbound setup failed: %v", err)
+			return
+		}
+		target, err := dialer.Dial("tcp", destAddrStr)
 		if err != nil {
 			logx.Warnf("Server", "Connect target failed: %v", err)
 			return

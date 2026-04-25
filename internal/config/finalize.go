@@ -210,6 +210,12 @@ func (c *Config) Finalize() error {
 		}
 	}
 
+	if c.Proxy != nil {
+		c.Proxy.Address = strings.TrimSpace(c.Proxy.Address)
+		c.Proxy.Username = strings.TrimSpace(c.Proxy.Username)
+		c.Proxy.Password = strings.TrimSpace(c.Proxy.Password)
+	}
+
 	// Proxy mode:
 	// - rule_urls: ["global"] / ["direct"] acts as a keyword override and clears RuleURLs.
 	// - any other non-empty rule_urls means PAC mode.

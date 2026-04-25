@@ -42,6 +42,9 @@ type wizardInput struct {
 	HTTPMaskPathRoot  string
 	HTTPMaskMultiplex string
 
+	OutboundProxyAddress  string
+	OutboundProxyUsername string
+	OutboundProxyPassword string
 	Key string
 
 	ServerPath string
@@ -91,6 +94,13 @@ func runSetupWizardPrompt(defaultServerPath, publicHost string) (wizardInput, er
 	httpMaskPathRoot := strings.TrimSpace(promptString(reader, "HTTP mask path root (optional, e.g. aabbcc)", "", ""))
 	httpMaskMux := strings.TrimSpace(promptString(reader, "HTTP mask multiplex (off / auto / on)", "", "off"))
 
+	outboundProxyAddr := promptString(reader, "Outbound SOCKS proxy address (optional, e.g. 127.0.0.1:1080)", "", "")
+	outboundProxyUser := ""
+	outboundProxyPass := ""
+	if outboundProxyAddr != "" {
+		outboundProxyUser = promptString(reader, "Outbound SOCKS proxy username (optional)", "", "")
+		outboundProxyPass = promptString(reader, "Outbound SOCKS proxy password (optional)", "", "")
+	}
 	keyInput := promptString(reader, "Shared key (leave empty to auto-generate)", "", "")
 
 	serverPath := promptString(reader, "Server config output path", defaultServerPath, defaultServerPath)
@@ -120,6 +130,9 @@ func runSetupWizardPrompt(defaultServerPath, publicHost string) (wizardInput, er
 		HTTPMaskHost:      httpMaskHost,
 		HTTPMaskPathRoot:  httpMaskPathRoot,
 		HTTPMaskMultiplex: httpMaskMux,
+		OutboundProxyAddress:  outboundProxyAddr,
+		OutboundProxyUsername: outboundProxyUser,
+		OutboundProxyPassword: outboundProxyPass,
 		Key:               keyInput,
 		ServerPath:        serverPath,
 		ClientPath:        clientPath,
@@ -204,6 +217,14 @@ func finalizeWizard(in wizardInput) (*WizardResult, error) {
 		CustomTable:        customTable,
 		EnablePureDownlink: in.EnablePureDown,
 		HTTPMask:           httpMaskCfg,
+	}
+	// Populate outbound proxy config for server
+	if strings.TrimSpace(in.OutboundProxyAddress) != "" {
+		serverCfg.Proxy = &config.ProxyConfig{
+			Address:  strings.TrimSpace(in.OutboundProxyAddress),
+			Username: strings.TrimSpace(in.OutboundProxyUsername),
+			Password: strings.TrimSpace(in.OutboundProxyPassword),
+		}
 	}
 
 	clientCfg := &config.Config{

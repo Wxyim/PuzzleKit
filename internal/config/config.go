@@ -39,4 +39,13 @@ type Config struct {
 	HTTPMask           HTTPMaskConfig `json:"httpmask"`
 
 	Reverse *ReverseConfig `json:"reverse,omitempty"`
+	// Proxy config for outbound connections from the server.
+	Proxy *ProxyConfig `json:"proxy,omitempty"`
+}
+
+// ProxyConfig holds configuration for an outbound SOCKS proxy.
+type ProxyConfig struct {
+	Address  string `json:"address"`            // SOCKS proxy address (e.g., "127.0.0.1:1080")
+	Username string `json:"username,omitempty"` // Optional username for SOCKS5 authentication
+	Password string `json:"password,omitempty"` // Optional password for SOCKS5 authentication
 }
