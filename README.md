@@ -34,7 +34,9 @@ Version requirements:
 - **Sudodroid (official Sudoku client)**: https://github.com/SUDOKU-ASCII/sudoku-android
 
 ### iOS
-- **Clash Lite**: (App Store: https://apps.apple.com/us/app/clash-lite/id6761357475)
+- **Anywhere Proxy**: https://github.com/NodePassProject/Anywhere (App Store: https://apps.apple.com/us/app/anywhere-proxy/id6758235178)
+
+> A highly lightweight native Swift implementation of Sudoku. It offers a significant boost in performance and lower resource overhead compared to iOS apps based on the Mihomo core.
 
 ### Desktop (Windows/macOS/Linux)
 - **Sudoku Desktop (official Sudoku desktop client)**: https://github.com/SUDOKU-ASCII/sudoku-desktop
