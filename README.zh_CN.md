@@ -30,7 +30,9 @@
 - **Sudodroid（官方 Sudoku 客户端）**：https://github.com/SUDOKU-ASCII/sudoku-android
 
 ### iOS
-- **Clash Lite**：（App Store： https://apps.apple.com/us/app/clash-lite/id6761357475 ）
+- **Anywhere Proxy**: https://github.com/NodePassProject/Anywhere (App Store: https://apps.apple.com/us/app/anywhere-proxy/id6758235178)
+
+> 非常轻量的swift原生sudoku实现，占用与性能相较mihomo内核的iOS应用有不俗提升，且由sudoku官方参与sudoku协议的开发，更加原生
 
 ### 桌面端（Windows/macOS/Linux）
 - **Sudoku Desktop（官方 Sudoku 桌面客户端）**：https://github.com/SUDOKU-ASCII/sudoku-desktop
