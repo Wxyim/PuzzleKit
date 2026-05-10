@@ -28,13 +28,14 @@ import (
 )
 
 const (
-	// Each estimated MTU-sized downlink segment gets an independent padding chance.
-	defaultInjectMTUBytes = 1460
+	// Each MTU-sized raw downlink chunk gets an independent padding chance. 1440
+	// matches common full-sized TCP payloads when timestamp/options are present.
+	defaultInjectMTUBytes = 1440
 
 	// Random low-frequency injection keeps the pattern irregular while limiting average
-	// overhead. 1/7 means only a small subset of MTU-sized segments get a spacer packet.
+	// overhead. 1/13 means only a small subset of MTU-sized segments get a spacer packet.
 	defaultInjectChanceNumerator   = 1
-	defaultInjectChanceDenominator = 7
+	defaultInjectChanceDenominator = 13
 
 	// Inter-packet padding must stay small so it behaves like a pacing spacer.
 	defaultPaddingPacketMin = 1
@@ -59,8 +60,6 @@ func defaultDownlinkPacingConfig() downlinkPacingConfig {
 	}
 }
 
-type downlinkWireSizeEstimator func(plainBytes int) int
-
 type randomPaddingPolicy struct {
 	mtuWireBytes int
 	numerator    int
@@ -75,26 +74,21 @@ func newRandomPaddingPolicy(cfg downlinkPacingConfig) *randomPaddingPolicy {
 	}
 }
 
-// InjectionCount gives each estimated MTU-sized downlink segment an independent chance
-// to emit a small spacer packet.
-func (p *randomPaddingPolicy) InjectionCount(plainBytes int, estimate downlinkWireSizeEstimator, rng randomSource) int {
-	if p == nil || rng == nil || estimate == nil {
-		return 0
-	}
-	opportunities := estimate(plainBytes) / p.mtuWireBytes
-	if opportunities <= 0 || p.numerator <= 0 {
-		return 0
+func (p *randomPaddingPolicy) ShouldInject(rng randomSource) bool {
+	if p == nil || rng == nil || p.numerator <= 0 {
+		return false
 	}
 	if p.numerator >= p.denominator {
-		return opportunities
+		return true
 	}
-	count := 0
-	for i := 0; i < opportunities; i++ {
-		if rng.Intn(p.denominator) < p.numerator {
-			count++
-		}
+	return rng.Intn(p.denominator) < p.numerator
+}
+
+func (p *randomPaddingPolicy) MTUBytes() int {
+	if p == nil || p.mtuWireBytes <= 0 {
+		return defaultInjectMTUBytes
 	}
-	return count
+	return p.mtuWireBytes
 }
 
 type interPacketPaddingInjector struct {
@@ -141,39 +135,89 @@ func (i *interPacketPaddingInjector) pickPacketLen() int {
 	return i.minPacketLen + i.rng.Intn(i.maxPacketLen-i.minPacketLen+1)
 }
 
+type pacingRawWriter struct {
+	writer   io.Writer
+	policy   *randomPaddingPolicy
+	injector *interPacketPaddingInjector
+	pending  int
+}
+
+func newPacingRawWriter(raw io.Writer, paddingPool []byte, rng randomSource, cfg downlinkPacingConfig) *pacingRawWriter {
+	return &pacingRawWriter{
+		writer:   raw,
+		policy:   newRandomPaddingPolicy(cfg),
+		injector: newInterPacketPaddingInjector(raw, paddingPool, rng, cfg),
+	}
+}
+
+func (w *pacingRawWriter) Write(p []byte) (int, error) {
+	if len(p) == 0 {
+		return 0, nil
+	}
+	if w == nil || w.writer == nil || w.policy == nil {
+		return 0, io.ErrClosedPipe
+	}
+
+	mtu := w.policy.MTUBytes()
+	written := 0
+	for len(p) > 0 {
+		need := mtu - w.pending
+		if need <= 0 {
+			need = mtu
+			w.pending = 0
+		}
+		if need > len(p) {
+			need = len(p)
+		}
+
+		chunk := p[:need]
+		if err := connutil.WriteFull(w.writer, chunk); err != nil {
+			return written, err
+		}
+		written += len(chunk)
+		w.pending += len(chunk)
+		p = p[need:]
+
+		if w.pending >= mtu {
+			w.pending = 0
+			if w.policy.ShouldInject(w.injector.rng) {
+				if err := w.injector.Inject(); err != nil {
+					return written, err
+				}
+			}
+		}
+	}
+	return written, nil
+}
+
+type pacingNetConn struct {
+	net.Conn
+	writer *pacingRawWriter
+}
+
+func (c *pacingNetConn) Write(p []byte) (int, error) {
+	return c.writer.Write(p)
+}
+
 // DownlinkPacingWriter encodes payload bytes with the underlying downlink codec and
 // occasionally injects a tiny pure-padding spacer packet.
 type DownlinkPacingWriter struct {
-	dataWriter        io.Writer
-	wireSizeEstimator downlinkWireSizeEstimator
-	paddingPolicy     *randomPaddingPolicy
-	injector          *interPacketPaddingInjector
-
-	writeMu sync.Mutex
+	dataWriter io.Writer
+	writeMu    sync.Mutex
 }
 
 func NewDownlinkPacingWriter(raw io.Writer, table *Table, pMin, pMax int) *DownlinkPacingWriter {
 	localRng := newSeededRand()
-	return newDownlinkPacingWriterWithConfig(
-		newSudokuDataWriter(raw, table, localRng, pMin, pMax),
-		raw,
-		table.PaddingPool,
-		minEncodedSudokuBytes,
-		localRng,
-		defaultDownlinkPacingConfig(),
-	)
+	cfg := defaultDownlinkPacingConfig()
+	pacedRaw := newPacingRawWriter(raw, table.PaddingPool, localRng, cfg)
+	return newDownlinkPacingWriterWithConfig(newSudokuDataWriter(pacedRaw, table, localRng, pMin, pMax))
 }
 
 func NewPackedDownlinkPacingWriter(raw net.Conn, table *Table, pMin, pMax int) (*PackedConn, *DownlinkPacingWriter) {
-	packed := NewPackedConn(raw, table, pMin, pMax)
-	return packed, newDownlinkPacingWriterWithConfig(
-		packed,
-		raw,
-		packedInterPacketPaddingPool(table),
-		minEncodedPackedBytes,
-		newSeededRand(),
-		defaultDownlinkPacingConfig(),
-	)
+	cfg := defaultDownlinkPacingConfig()
+	pacedRaw := newPacingRawWriter(raw, packedInterPacketPaddingPool(table), newSeededRand(), cfg)
+	packed := NewPackedConn(&pacingNetConn{Conn: raw, writer: pacedRaw}, table, pMin, pMax)
+	return packed, newDownlinkPacingWriterWithConfig(packed)
 }
 
 func NewServerDownlinkWriter(raw net.Conn, table *Table, pMin, pMax int, pure bool) (io.Writer, []func() error) {
@@ -187,17 +231,9 @@ func NewServerDownlinkWriter(raw net.Conn, table *Table, pMin, pMax int, pure bo
 
 func newDownlinkPacingWriterWithConfig(
 	dataWriter io.Writer,
-	raw io.Writer,
-	paddingPool []byte,
-	estimate downlinkWireSizeEstimator,
-	rng randomSource,
-	cfg downlinkPacingConfig,
 ) *DownlinkPacingWriter {
 	return &DownlinkPacingWriter{
-		dataWriter:        dataWriter,
-		wireSizeEstimator: estimate,
-		paddingPolicy:     newRandomPaddingPolicy(cfg),
-		injector:          newInterPacketPaddingInjector(raw, paddingPool, rng, cfg),
+		dataWriter: dataWriter,
 	}
 }
 
@@ -212,12 +248,6 @@ func (w *DownlinkPacingWriter) Write(p []byte) (int, error) {
 	n, err := w.dataWriter.Write(p)
 	if err != nil {
 		return n, err
-	}
-	injections := w.paddingPolicy.InjectionCount(n, w.wireSizeEstimator, w.injector.rng)
-	for i := 0; i < injections; i++ {
-		if err := w.injector.Inject(); err != nil {
-			return n, err
-		}
 	}
 	return n, nil
 }

@@ -34,14 +34,16 @@ func TestRandomPaddingPolicy_SizeGateAndProbability(t *testing.T) {
 
 	policy := newRandomPaddingPolicy(cfg)
 	rng := newSudokuRand(1)
-	if got := policy.InjectionCount(3, minEncodedSudokuBytes, rng); got != 0 {
-		t.Fatalf("small write should not trigger pacing")
+	if policy.MTUBytes() != 16 {
+		t.Fatalf("mtu bytes = %d, want 16", policy.MTUBytes())
 	}
-	if got := policy.InjectionCount(4, minEncodedSudokuBytes, rng); got != 1 {
-		t.Fatalf("one MTU write injection count = %d, want 1", got)
+	if !policy.ShouldInject(rng) {
+		t.Fatalf("forced probability should inject")
 	}
-	if got := policy.InjectionCount(8, minEncodedSudokuBytes, rng); got != 2 {
-		t.Fatalf("two MTU write injection count = %d, want 2", got)
+	cfg.injectChanceNumerator = 0
+	policy = newRandomPaddingPolicy(cfg)
+	if policy.ShouldInject(rng) {
+		t.Fatalf("zero probability should not inject")
 	}
 }
 
@@ -95,6 +97,43 @@ func TestDownlinkPacingWriter_InjectsPurePaddingOnEligibleWrite(t *testing.T) {
 	}
 	if extra := countNonHintBytes(raw.Bytes(), table); extra != 5 {
 		t.Fatalf("expected exactly one 5-byte padding packet, got %d extra bytes", extra)
+	}
+}
+
+func TestPacingRawWriter_InjectsAfterEachMTUChunk(t *testing.T) {
+	table := NewTable("pacing-raw", "prefer_ascii")
+	cfg := defaultDownlinkPacingConfig()
+	cfg.mtuWireBytes = 4
+	cfg.injectChanceNumerator = 1
+	cfg.injectChanceDenominator = 1
+	cfg.paddingPacketMin = 2
+	cfg.paddingPacketMax = 2
+
+	var raw bytes.Buffer
+	writer := newPacingRawWriter(&raw, table.PaddingPool, newSudokuRand(4), cfg)
+	payload := []byte("abcdefgh")
+
+	n, err := writer.Write(payload)
+	if err != nil {
+		t.Fatalf("write failed: %v", err)
+	}
+	if n != len(payload) {
+		t.Fatalf("write len mismatch: got %d want %d", n, len(payload))
+	}
+	if got, want := raw.Len(), len(payload)+4; got != want {
+		t.Fatalf("wire len = %d, want %d", got, want)
+	}
+	if !bytes.Equal(raw.Bytes()[:4], payload[:4]) {
+		t.Fatalf("first mtu chunk changed")
+	}
+	if !bytes.Equal(raw.Bytes()[6:10], payload[4:]) {
+		t.Fatalf("second mtu chunk not placed after first padding")
+	}
+	if extra := countNonHintBytes(raw.Bytes()[4:6], table); extra != 2 {
+		t.Fatalf("first spacer has %d padding bytes, want 2", extra)
+	}
+	if extra := countNonHintBytes(raw.Bytes()[10:12], table); extra != 2 {
+		t.Fatalf("second spacer has %d padding bytes, want 2", extra)
 	}
 }
 
@@ -184,24 +223,13 @@ func countNonHintBytes(data []byte, table *Table) int {
 }
 
 func newTestSudokuPacingWriter(raw io.Writer, table *Table, cfg downlinkPacingConfig) *DownlinkPacingWriter {
-	return newDownlinkPacingWriterWithConfig(
-		newSudokuDataWriter(raw, table, newSudokuRand(1), 0, 0),
-		raw,
-		table.PaddingPool,
-		minEncodedSudokuBytes,
-		newSudokuRand(2),
-		cfg,
-	)
+	rng := newSudokuRand(1)
+	pacedRaw := newPacingRawWriter(raw, table.PaddingPool, rng, cfg)
+	return newDownlinkPacingWriterWithConfig(newSudokuDataWriter(pacedRaw, table, rng, 0, 0))
 }
 
 func newTestPackedPacingWriter(raw net.Conn, table *Table, cfg downlinkPacingConfig) (*PackedConn, *DownlinkPacingWriter) {
-	packed := NewPackedConn(raw, table, 0, 0)
-	return packed, newDownlinkPacingWriterWithConfig(
-		packed,
-		raw,
-		packedInterPacketPaddingPool(table),
-		minEncodedPackedBytes,
-		newSudokuRand(3),
-		cfg,
-	)
+	pacedRaw := newPacingRawWriter(raw, packedInterPacketPaddingPool(table), newSudokuRand(3), cfg)
+	packed := NewPackedConn(&pacingNetConn{Conn: raw, writer: pacedRaw}, table, 0, 0)
+	return packed, newDownlinkPacingWriterWithConfig(packed)
 }
