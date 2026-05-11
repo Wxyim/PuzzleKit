@@ -28,69 +28,54 @@ import (
 )
 
 const (
-	// Only payloads that are already large enough to occupy multiple packets on the wire
-	// are eligible for extra inter-packet padding. This keeps short replies/control frames
-	// out of the path without requiring a separate burst detector.
-	defaultInjectMinWireBytes = 2 * 1460
+	// Each MTU-sized raw downlink chunk gets an independent padding chance. 1440
+	// matches common full-sized TCP payloads when timestamp/options are present.
+	defaultInjectMTUBytes = 1440
 
 	// Random low-frequency injection keeps the pattern irregular while limiting average
-	// overhead. 1/8 means only a small subset of eligible writes get a spacer packet.
+	// overhead. 1/13 means only a small subset of MTU-sized segments get a spacer packet.
 	defaultInjectChanceNumerator   = 1
-	defaultInjectChanceDenominator = 8
+	defaultInjectChanceDenominator = 13
 
-	// Inter-packet padding must stay small so it behaves like a pacing spacer rather
-	// than a second payload burst. The exact length is adapted from the payload size.
-	defaultPaddingPacketMin = 24
-	defaultPaddingPacketMax = 96
-	defaultPaddingJitter    = 12
+	// Inter-packet padding must stay small so it behaves like a pacing spacer.
+	defaultPaddingPacketMin = 1
+	defaultPaddingPacketMax = 128
 )
 
 type downlinkPacingConfig struct {
-	minInjectWireBytes      int
+	mtuWireBytes            int
 	injectChanceNumerator   int
 	injectChanceDenominator int
 	paddingPacketMin        int
 	paddingPacketMax        int
-	paddingJitter           int
 }
 
 func defaultDownlinkPacingConfig() downlinkPacingConfig {
 	return downlinkPacingConfig{
-		minInjectWireBytes:      defaultInjectMinWireBytes,
+		mtuWireBytes:            defaultInjectMTUBytes,
 		injectChanceNumerator:   defaultInjectChanceNumerator,
 		injectChanceDenominator: defaultInjectChanceDenominator,
 		paddingPacketMin:        defaultPaddingPacketMin,
 		paddingPacketMax:        defaultPaddingPacketMax,
-		paddingJitter:           defaultPaddingJitter,
 	}
 }
 
-type downlinkWireSizeEstimator func(plainBytes int) int
-
 type randomPaddingPolicy struct {
-	minWireBytes int
+	mtuWireBytes int
 	numerator    int
 	denominator  int
 }
 
 func newRandomPaddingPolicy(cfg downlinkPacingConfig) *randomPaddingPolicy {
 	return &randomPaddingPolicy{
-		minWireBytes: maxInt(cfg.minInjectWireBytes, 1),
+		mtuWireBytes: maxInt(cfg.mtuWireBytes, 1),
 		numerator:    clampInt(cfg.injectChanceNumerator, 0, maxInt(cfg.injectChanceDenominator, 1)),
 		denominator:  maxInt(cfg.injectChanceDenominator, 1),
 	}
 }
 
-// ShouldInject applies a lightweight size gate plus random probability. This keeps the
-// feature stochastic without needing a separate sustained-burst state machine.
-func (p *randomPaddingPolicy) ShouldInject(plainBytes int, estimate downlinkWireSizeEstimator, rng randomSource) bool {
-	if p == nil || rng == nil || estimate == nil {
-		return false
-	}
-	if estimate(plainBytes) < p.minWireBytes {
-		return false
-	}
-	if p.numerator <= 0 {
+func (p *randomPaddingPolicy) ShouldInject(rng randomSource) bool {
+	if p == nil || rng == nil || p.numerator <= 0 {
 		return false
 	}
 	if p.numerator >= p.denominator {
@@ -99,13 +84,19 @@ func (p *randomPaddingPolicy) ShouldInject(plainBytes int, estimate downlinkWire
 	return rng.Intn(p.denominator) < p.numerator
 }
 
+func (p *randomPaddingPolicy) MTUBytes() int {
+	if p == nil || p.mtuWireBytes <= 0 {
+		return defaultInjectMTUBytes
+	}
+	return p.mtuWireBytes
+}
+
 type interPacketPaddingInjector struct {
 	writer       io.Writer
 	paddingPool  []byte
 	rng          randomSource
 	minPacketLen int
 	maxPacketLen int
-	jitter       int
 	packetBuf    []byte
 }
 
@@ -116,78 +107,117 @@ func newInterPacketPaddingInjector(writer io.Writer, paddingPool []byte, rng ran
 		rng:          rng,
 		minPacketLen: maxInt(cfg.paddingPacketMin, 1),
 		maxPacketLen: maxInt(cfg.paddingPacketMax, cfg.paddingPacketMin),
-		jitter:       maxInt(cfg.paddingJitter, 0),
 	}
 }
 
-// Inject writes a pure-padding packet directly to the raw transport. Receivers that do
-// not implement pacing still discard it safely because the bytes never match Sudoku hints.
-func (i *interPacketPaddingInjector) Inject(plainBytes int) error {
+// Inject writes a small pure-padding packet directly to the raw transport. Receivers
+// safely discard it because these bytes never match Sudoku hints.
+func (i *interPacketPaddingInjector) Inject() error {
 	if i == nil || len(i.paddingPool) == 0 || i.writer == nil || i.rng == nil {
 		return nil
 	}
 
-	packetLen := i.pickPacketLen(plainBytes)
+	packetLen := i.pickPacketLen()
 	if cap(i.packetBuf) < packetLen {
 		i.packetBuf = make([]byte, packetLen)
 	}
-	packet := i.packetBuf[:packetLen]
-	for idx := range packet {
-		packet[idx] = i.paddingPool[i.rng.Intn(len(i.paddingPool))]
+	packet := i.packetBuf[:0]
+	for len(packet) < packetLen {
+		packet = append(packet, i.paddingPool[i.rng.Intn(len(i.paddingPool))])
 	}
 	return connutil.WriteFull(i.writer, packet)
 }
 
-func (i *interPacketPaddingInjector) pickPacketLen(plainBytes int) int {
+func (i *interPacketPaddingInjector) pickPacketLen() int {
 	if i.maxPacketLen <= i.minPacketLen {
 		return i.minPacketLen
 	}
+	return i.minPacketLen + i.rng.Intn(i.maxPacketLen-i.minPacketLen+1)
+}
 
-	// Scale the spacer size from the payload, then keep it inside a narrow range so the
-	// pacing packet stays lightweight even during very large downloads.
-	base := minEncodedSudokuBytes(plainBytes) / 192
-	base = clampInt(base, i.minPacketLen, i.maxPacketLen)
-	low := clampInt(base-i.jitter, i.minPacketLen, i.maxPacketLen)
-	high := clampInt(base+i.jitter, low, i.maxPacketLen)
-	if high == low {
-		return low
+type pacingRawWriter struct {
+	writer   io.Writer
+	policy   *randomPaddingPolicy
+	injector *interPacketPaddingInjector
+	pending  int
+}
+
+func newPacingRawWriter(raw io.Writer, paddingPool []byte, rng randomSource, cfg downlinkPacingConfig) *pacingRawWriter {
+	return &pacingRawWriter{
+		writer:   raw,
+		policy:   newRandomPaddingPolicy(cfg),
+		injector: newInterPacketPaddingInjector(raw, paddingPool, rng, cfg),
 	}
-	return low + i.rng.Intn(high-low+1)
+}
+
+func (w *pacingRawWriter) Write(p []byte) (int, error) {
+	if len(p) == 0 {
+		return 0, nil
+	}
+	if w == nil || w.writer == nil || w.policy == nil {
+		return 0, io.ErrClosedPipe
+	}
+
+	mtu := w.policy.MTUBytes()
+	written := 0
+	for len(p) > 0 {
+		need := mtu - w.pending
+		if need <= 0 {
+			need = mtu
+			w.pending = 0
+		}
+		if need > len(p) {
+			need = len(p)
+		}
+
+		chunk := p[:need]
+		if err := connutil.WriteFull(w.writer, chunk); err != nil {
+			return written, err
+		}
+		written += len(chunk)
+		w.pending += len(chunk)
+		p = p[need:]
+
+		if w.pending >= mtu {
+			w.pending = 0
+			if w.policy.ShouldInject(w.injector.rng) {
+				if err := w.injector.Inject(); err != nil {
+					return written, err
+				}
+			}
+		}
+	}
+	return written, nil
+}
+
+type pacingNetConn struct {
+	net.Conn
+	writer *pacingRawWriter
+}
+
+func (c *pacingNetConn) Write(p []byte) (int, error) {
+	return c.writer.Write(p)
 }
 
 // DownlinkPacingWriter encodes payload bytes with the underlying downlink codec and
 // occasionally injects a tiny pure-padding spacer packet.
 type DownlinkPacingWriter struct {
-	dataWriter        io.Writer
-	wireSizeEstimator downlinkWireSizeEstimator
-	paddingPolicy     *randomPaddingPolicy
-	injector          *interPacketPaddingInjector
-
-	writeMu sync.Mutex
+	dataWriter io.Writer
+	writeMu    sync.Mutex
 }
 
 func NewDownlinkPacingWriter(raw io.Writer, table *Table, pMin, pMax int) *DownlinkPacingWriter {
 	localRng := newSeededRand()
-	return newDownlinkPacingWriterWithConfig(
-		newSudokuDataWriter(raw, table, localRng, pMin, pMax),
-		raw,
-		table.PaddingPool,
-		minEncodedSudokuBytes,
-		localRng,
-		defaultDownlinkPacingConfig(),
-	)
+	cfg := defaultDownlinkPacingConfig()
+	pacedRaw := newPacingRawWriter(raw, table.PaddingPool, localRng, cfg)
+	return newDownlinkPacingWriterWithConfig(newSudokuDataWriter(pacedRaw, table, localRng, pMin, pMax))
 }
 
 func NewPackedDownlinkPacingWriter(raw net.Conn, table *Table, pMin, pMax int) (*PackedConn, *DownlinkPacingWriter) {
-	packed := NewPackedConn(raw, table, pMin, pMax)
-	return packed, newDownlinkPacingWriterWithConfig(
-		packed,
-		raw,
-		packedInterPacketPaddingPool(table),
-		minEncodedPackedBytes,
-		newSeededRand(),
-		defaultDownlinkPacingConfig(),
-	)
+	cfg := defaultDownlinkPacingConfig()
+	pacedRaw := newPacingRawWriter(raw, packedInterPacketPaddingPool(table), newSeededRand(), cfg)
+	packed := NewPackedConn(&pacingNetConn{Conn: raw, writer: pacedRaw}, table, pMin, pMax)
+	return packed, newDownlinkPacingWriterWithConfig(packed)
 }
 
 func NewServerDownlinkWriter(raw net.Conn, table *Table, pMin, pMax int, pure bool) (io.Writer, []func() error) {
@@ -201,17 +231,9 @@ func NewServerDownlinkWriter(raw net.Conn, table *Table, pMin, pMax int, pure bo
 
 func newDownlinkPacingWriterWithConfig(
 	dataWriter io.Writer,
-	raw io.Writer,
-	paddingPool []byte,
-	estimate downlinkWireSizeEstimator,
-	rng randomSource,
-	cfg downlinkPacingConfig,
 ) *DownlinkPacingWriter {
 	return &DownlinkPacingWriter{
-		dataWriter:        dataWriter,
-		wireSizeEstimator: estimate,
-		paddingPolicy:     newRandomPaddingPolicy(cfg),
-		injector:          newInterPacketPaddingInjector(raw, paddingPool, rng, cfg),
+		dataWriter: dataWriter,
 	}
 }
 
@@ -226,11 +248,6 @@ func (w *DownlinkPacingWriter) Write(p []byte) (int, error) {
 	n, err := w.dataWriter.Write(p)
 	if err != nil {
 		return n, err
-	}
-	if w.paddingPolicy.ShouldInject(n, w.wireSizeEstimator, w.injector.rng) {
-		if err := w.injector.Inject(n); err != nil {
-			return n, err
-		}
 	}
 	return n, nil
 }
