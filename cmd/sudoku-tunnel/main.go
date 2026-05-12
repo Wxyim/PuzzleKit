@@ -22,6 +22,7 @@ package main
 import (
 	"flag"
 	"os"
+	"path/filepath"
 
 	"github.com/SUDOKU-ASCII/sudoku/internal/app"
 	"github.com/SUDOKU-ASCII/sudoku/internal/cli"
@@ -53,8 +54,27 @@ func init() {
 }
 
 func main() {
+	var strippedArg string
+	if len(os.Args) > 1 && filepath.IsAbs(os.Args[1]) {
+		execPath, _ := os.Executable()
+		isSameFile := false
+		if infoArg, errArg := os.Stat(os.Args[1]); errArg == nil {
+			if infoExec, errExec := os.Stat(execPath); errExec == nil {
+				isSameFile = os.SameFile(infoArg, infoExec)
+			}
+		}
+		if os.Args[1] == execPath || isSameFile {
+			strippedArg = os.Args[1]
+			os.Args = append(os.Args[:1], os.Args[2:]...)
+		}
+	}
+
 	flag.Parse()
 	logx.InstallStd()
+
+	if strippedArg != "" {
+		logx.Warnf("CLI", "Removed injected environment path argument: %s", strippedArg)
+	}
 
 	if *revDial != "" || *revListen != "" {
 		if *revDial == "" || *revListen == "" {

@@ -52,10 +52,10 @@ jobs:
             cgo: "0"
             tags: ""
             asset_name: sudoku-linux-arm64
-          - goos: linux
+          - goos: android
             goarch: arm64
             cgo: "0"
-            tags: "-tags android"
+            tags: ""
             asset_name: sudoku-android-arm64
 
     steps:
