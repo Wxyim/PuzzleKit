@@ -44,10 +44,19 @@ jobs:
         include:
           - goos: linux
             goarch: amd64
+            cgo: "0"
+            tags: ""
             asset_name: sudoku-linux-amd64
           - goos: linux
             goarch: arm64
+            cgo: "0"
+            tags: ""
             asset_name: sudoku-linux-arm64
+          - goos: linux
+            goarch: arm64
+            cgo: "0"
+            tags: "-tags android"
+            asset_name: sudoku-android-arm64
 
     steps:
       - name: Checkout code
@@ -63,10 +72,10 @@ jobs:
         env:
           GOOS: ${{ matrix.goos }}
           GOARCH: ${{ matrix.goarch }}
-          CGO_ENABLED: 0
+          CGO_ENABLED: ${{ matrix.cgo }}
         run: |
           OUTPUT_NAME=sudoku
-          go build -ldflags "-s -w" -o $OUTPUT_NAME ./cmd/sudoku-tunnel
+          go build ${{ matrix.tags }} -ldflags "-s -w" -o $OUTPUT_NAME ./cmd/sudoku-tunnel
 
       - name: Package Assets
         run: |
