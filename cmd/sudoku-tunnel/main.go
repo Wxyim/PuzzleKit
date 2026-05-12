@@ -56,16 +56,22 @@ func init() {
 func main() {
 	var strippedArg string
 	if len(os.Args) > 1 && filepath.IsAbs(os.Args[1]) {
-		execPath, _ := os.Executable()
-		isSameFile := false
-		if infoArg, errArg := os.Stat(os.Args[1]); errArg == nil {
-			if infoExec, errExec := os.Stat(execPath); errExec == nil {
-				isSameFile = os.SameFile(infoArg, infoExec)
+		if info1, err := os.Stat(os.Args[1]); err == nil && !info1.IsDir() {
+			isSameFile := false
+			if info0, err0 := os.Stat(os.Args[0]); err0 == nil {
+				isSameFile = os.SameFile(info1, info0)
 			}
-		}
-		if os.Args[1] == execPath || isSameFile {
-			strippedArg = os.Args[1]
-			os.Args = append(os.Args[:1], os.Args[2:]...)
+			if !isSameFile {
+				if execPath, errExec := os.Executable(); errExec == nil {
+					if infoExec, errStat := os.Stat(execPath); errStat == nil {
+						isSameFile = os.SameFile(info1, infoExec)
+					}
+				}
+			}
+			if isSameFile {
+				strippedArg = os.Args[1]
+				os.Args = append(os.Args[:1], os.Args[2:]...)
+			}
 		}
 	}
 
