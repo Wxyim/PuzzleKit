@@ -33,7 +33,7 @@ func TestRuntimeRuleURLs(t *testing.T) {
 		"_https://example.com/proxy-2.yaml",
 		"!https://example.com/reject-1.yaml",
 		"！https://example.com/reject-2.yaml",
-		"?https://example.com/reject-3.yaml",
+		"?https://example.com/reserved.yaml",
 	})
 
 	if len(direct) != 1 || direct[0] != "https://example.com/direct.list" {
@@ -42,7 +42,7 @@ func TestRuntimeRuleURLs(t *testing.T) {
 	if len(proxy) != 2 || proxy[0] != "https://example.com/proxy-1.yaml" || proxy[1] != "https://example.com/proxy-2.yaml" {
 		t.Fatalf("unexpected proxy rules: %v", proxy)
 	}
-	if len(reject) != 3 || reject[0] != "https://example.com/reject-1.yaml" || reject[1] != "https://example.com/reject-2.yaml" || reject[2] != "https://example.com/reject-3.yaml" {
+	if len(reject) != 2 || reject[0] != "https://example.com/reject-1.yaml" || reject[1] != "https://example.com/reject-2.yaml" {
 		t.Fatalf("unexpected reject rules: %v", reject)
 	}
 
@@ -55,5 +55,19 @@ func TestRuntimeRuleURLs(t *testing.T) {
 	}
 	if len(reject) != 1 || reject[0] != DefaultImplicitRejectRuleURL {
 		t.Fatalf("unexpected implicit reject rules: %v", reject)
+	}
+}
+
+func TestFinalizeIgnoresReservedQuestionRuleURLs(t *testing.T) {
+	cfg := &Config{RuleURLs: []string{"?https://example.com/future.yaml"}}
+
+	if err := cfg.Finalize(); err != nil {
+		t.Fatalf("Finalize error: %v", err)
+	}
+	if cfg.ProxyMode != "global" {
+		t.Fatalf("reserved rule url should not force PAC mode, got %s", cfg.ProxyMode)
+	}
+	if len(cfg.RuleURLs) != 1 || cfg.RuleURLs[0] != "?https://example.com/future.yaml" {
+		t.Fatalf("reserved rule urls should be preserved for future use, got %v", cfg.RuleURLs)
 	}
 }

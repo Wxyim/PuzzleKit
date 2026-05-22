@@ -4,7 +4,7 @@
 - TBD
 
 ## v0.4.5（2026-05-22）
-- `proxy/pac`: `rule_urls` 新增 `-https://...` / `_https://...` proxy 规则源语义；命中 proxy 规则的目标会优先走代理，可用于覆盖默认直连规则中的个别域名或网段；同时兼容 `?https://...` reject 规则源写法。
+- `proxy/pac`: `rule_urls` 新增 `-https://...` / `_https://...` proxy 规则源语义；命中 proxy 规则的目标会优先走代理，可用于覆盖默认直连规则中的个别域名或网段。
 
 ## v0.4.1（2026-04-02）
 - `proxy/pac`: `rule_urls` 新增 `!https://...` / `！https://...` reject 规则源语义；命中 reject 规则的域名会在客户端侧直接拒绝，不再发起 TCP/UDP 外连，用于默认去广告与显式拦截场景。
