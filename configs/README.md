@@ -179,6 +179,7 @@ Raw TCP forwarding (one per server entry):
 - `["global"]`: proxy everything
 - `["direct"]`: proxy nothing
 - URL list: download rule files and route accordingly
+- `-https://...` / `_https://...`: proxy rule source; matched domains use the proxy even if they also match a direct rule
 - `!https://...` / `！https://...`: reject rule source; matched domains are blocked before any outbound connection is made
 - `["global"]` and `["direct"]` still apply the built-in hidden reject list via `https://fastly.jsdelivr.net/gh/TG-Twilight/AWAvenue-Ads-Rule@main/Filters/AWAvenue-Ads-Rule-Clash.yaml`
 
