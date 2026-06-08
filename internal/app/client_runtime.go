@@ -49,7 +49,7 @@ func buildClientRuntime(cfg *config.Config, tables []*sudoku.Table) (*clientRunt
 	}
 
 	var dialer tunnel.Dialer
-	if cfg.HTTPMaskSessionMuxEnabled() {
+	if cfg.SessionMuxEnabled() {
 		dialer = &tunnel.MuxDialer{BaseDialer: baseDialer}
 	} else {
 		dialer = &tunnel.StandardDialer{BaseDialer: baseDialer}
@@ -90,8 +90,8 @@ func buildOutboundDialer(runtimes []*clientRuntime) (tunnel.Dialer, error) {
 	}
 	if len(runtimes) == 1 {
 		rt := runtimes[0]
-		if rt.Config.HTTPMaskSessionMuxEnabled() {
-			logx.Infof("Init", "Enabled HTTPMask session mux (single tunnel, multi-target)")
+		if rt.Config.SessionMuxEnabled() {
+			logx.Infof("Init", "Enabled session mux (single tunnel, multi-target)")
 		}
 		return rt.Dialer, nil
 	}
@@ -99,7 +99,7 @@ func buildOutboundDialer(runtimes []*clientRuntime) (tunnel.Dialer, error) {
 	nodes := make([]tunnel.BalancedNode, 0, len(runtimes))
 	muxCount := 0
 	for _, rt := range runtimes {
-		if rt.Config.HTTPMaskSessionMuxEnabled() {
+		if rt.Config.SessionMuxEnabled() {
 			muxCount++
 		}
 		nodes = append(nodes, tunnel.BalancedNode{
@@ -109,7 +109,7 @@ func buildOutboundDialer(runtimes []*clientRuntime) (tunnel.Dialer, error) {
 	}
 
 	if muxCount > 0 {
-		logx.Infof("Init", "Enabled HTTPMask session mux on %d/%d outbound node(s)", muxCount, len(runtimes))
+		logx.Infof("Init", "Enabled session mux on %d/%d outbound node(s)", muxCount, len(runtimes))
 	}
 
 	return tunnel.NewBalancedDialer(nodes)

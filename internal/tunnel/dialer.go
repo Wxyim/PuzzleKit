@@ -85,7 +85,7 @@ func (d *BaseDialer) dialHTTPMaskTunnel(dialCtx context.Context, table *sudoku.T
 		Upgrade: func(raw net.Conn) (net.Conn, error) {
 			return upgrade(raw)
 		},
-		Multiplex: d.Config.HTTPMask.Multiplex,
+		Multiplex: d.Config.MultiplexMode(),
 	}
 	return httpmask.DialTunnel(dialCtx, d.Config.ServerAddress, opts)
 }

@@ -194,7 +194,7 @@ func runSetupWizardTUI(defaultServerPath, publicHost string) (wizardInput, bool,
 				Description("Example: aabbcc => /aabbcc/session, /aabbcc/api/v1/upload, ...").
 				Value(&httpMaskPathRoot),
 			huh.NewSelect[string]().
-				Title("HTTP mask multiplex").
+				Title("Multiplex").
 				Options(
 					huh.NewOption("off", "off"),
 					huh.NewOption("auto (try once, then remember)", "auto"),
