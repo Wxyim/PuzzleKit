@@ -175,11 +175,31 @@ func (d *BaseDialer) dialTarget(destAddrStr string) (net.Conn, error) {
 	if err != nil {
 		return nil, err
 	}
+	if d.deferInitialOpen() {
+		deferred, err := newDeferredKIPOpenConn(cConn, destAddrStr)
+		if err != nil {
+			_ = cConn.Close()
+			return nil, fmt.Errorf("prepare address failed: %w", err)
+		}
+		return deferred, nil
+	}
 	if err := writeKIPOpenTCP(cConn, destAddrStr); err != nil {
 		_ = cConn.Close()
 		return nil, fmt.Errorf("write address failed: %w", err)
 	}
 	return cConn, nil
+}
+
+func (d *BaseDialer) deferInitialOpen() bool {
+	if d == nil || d.Config == nil || !d.Config.HTTPMaskTunnelEnabled() {
+		return false
+	}
+	switch strings.TrimSpace(d.Config.HTTPMask.Mode) {
+	case "stream", "auto":
+		return true
+	default:
+		return false
+	}
 }
 
 func (d *BaseDialer) dialUoT() (net.Conn, error) {

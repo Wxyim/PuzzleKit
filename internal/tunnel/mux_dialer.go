@@ -24,6 +24,7 @@ import (
 	"fmt"
 	"net"
 	"sync"
+	"time"
 
 	"github.com/SUDOKU-ASCII/sudoku/internal/protocol"
 )
@@ -56,6 +57,9 @@ func (d *MuxDialer) Dial(destAddrStr string) (net.Conn, error) {
 	st := newMuxStream(sess, streamID)
 	sess.registerStream(st)
 
+	if d.deferInitialOpen() {
+		return newDeferredMuxOpenConn(st, addrBuf.Bytes()), nil
+	}
 	if err := sess.sendFrame(muxFrameOpen, streamID, addrBuf.Bytes()); err != nil {
 		st.closeNoSend(err)
 		sess.removeStream(streamID)
@@ -132,6 +136,9 @@ func (d *MuxDialer) getOrCreateSession() (*muxSession, error) {
 
 	d.mu.Lock()
 	sess := newMuxSession(baseConn, nil)
+	if d.deferInitialOpen() {
+		sess.enableDelayedClose(time.Second)
+	}
 	d.session = sess
 	d.creating = false
 	d.cond.Broadcast()
