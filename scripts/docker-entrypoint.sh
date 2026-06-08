@@ -62,7 +62,7 @@ init_server_config() {
   httpmask_enabled="${SUDOKU_HTTP_MASK:-1}"
   httpmask_mode="${SUDOKU_HTTP_MASK_MODE:-auto}"
   httpmask_path_root="${SUDOKU_HTTP_MASK_PATH_ROOT:-}"
-  httpmask_multiplex="${SUDOKU_HTTP_MASK_MULTIPLEX:-on}"
+  multiplex="${SUDOKU_MULTIPLEX:-${SUDOKU_HTTP_MASK_MULTIPLEX:-on}}"
 
   if [ -z "${SUDOKU_CUSTOM_TABLE:-}" ]; then
     custom_table="$(generate_xpv_table)"
@@ -131,13 +131,14 @@ init_server_config() {
   "custom_tables": [],
   "ascii": "$ascii",
   "enable_pure_downlink": $enable_pure_downlink,
+  "multiplex": "$multiplex",
   "httpmask": {
     "disable": $httpmask_disable,
     "mode": "$httpmask_mode",
     "tls": false,
     "host": "",
     "path_root": "$httpmask_path_root",
-    "multiplex": "$httpmask_multiplex"
+    "multiplex": "$multiplex"
   }
 }
 EOF
