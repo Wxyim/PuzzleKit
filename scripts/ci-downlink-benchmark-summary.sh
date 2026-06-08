@@ -5,6 +5,7 @@ CONNS="${SUDOKU_DOWNLINK_CONCURRENT_CONNS:-200}"
 BYTES_PER_CONN="${SUDOKU_DOWNLINK_CONCURRENT_BYTES:-1048576}"
 OUT="${RUNNER_TEMP:-/tmp}/sudoku-downlink-benchmark.txt"
 
+SUDOKU_LOG_LEVEL="${SUDOKU_LOG_LEVEL:-error}" \
 SUDOKU_DOWNLINK_CONCURRENT_CONNS="$CONNS" \
 SUDOKU_DOWNLINK_CONCURRENT_BYTES="$BYTES_PER_CONN" \
 go test -run '^$' \
@@ -18,10 +19,14 @@ import os
 import re
 import sys
 
-path, conns, bytes_per_conn = sys.argv[1], sys.argv[2], sys.argv[3]
+path, conns, bytes_per_conn = sys.argv[1:4]
+
+def metric(fields, label):
+    idx = fields.index(label)
+    return fields[idx - 1]
+
 prefix = "BenchmarkDownlinkThroughputConcurrentMatrix/"
 rows = []
-
 with open(path, "r", encoding="utf-8") as f:
     for line in f:
         if not line.startswith(prefix):
@@ -29,15 +34,12 @@ with open(path, "r", encoding="utf-8") as f:
         fields = line.split()
         name = fields[0][len(prefix):]
         name = re.sub(r"-\d+$", "", name)
-
-        def metric(label):
-            idx = fields.index(label)
-            return fields[idx - 1]
-
-        mb_s = float(metric("MB/s"))
-        b_op = int(metric("B/op"))
-        allocs_op = int(metric("allocs/op"))
+        mb_s = float(metric(fields, "MB/s"))
+        b_op = int(metric(fields, "B/op"))
+        allocs_op = int(metric(fields, "allocs/op"))
         rows.append((name, mb_s * 8, b_op, allocs_op))
+if not rows:
+    raise SystemExit("no downlink benchmark rows parsed")
 
 summary = [
     "## Downlink Throughput Benchmark",
