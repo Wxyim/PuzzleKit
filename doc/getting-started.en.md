@@ -63,20 +63,21 @@ You can start from the template: `configs/client.config.json`.
   "padding_max": 15,
   "custom_table": "xpxvvpvv",
   "ascii": "prefer_entropy",
+  "multiplex": "off",
   "httpmask": {
     "disable": false,
     "mode": "legacy",
     "tls": false,
     "host": "",
-    "path_root": "",
-    "multiplex": "off"
+    "path_root": ""
   },
   "rule_urls": ["global"]
 }
 ```
 - Want plaintext-looking traffic? Set `ascii` to `prefer_ascii` on both sides.
 - Need a custom byte fingerprint? Add `custom_table` (e.g. `xpxvvpvv` with two `x`, two `p`, four `v`; all 420 permutations are valid); ASCII mode still wins if enabled.
-- Want more downlink throughput? Set `enable_pure_downlink` to `false` on both sides to enable the packed mode (AEAD required).
+- Want more downlink throughput? Set `enable_pure_downlink` to `false` on both sides to enable the packed mode.
+- Multiplex: use `"multiplex": "auto"` for HTTPMask transport reuse in HTTP tunnel modes; use `"multiplex": "on"` for session mux over raw TCP or HTTPMask.
 - Routing mode tip: `rule_urls: ["global"]` proxies everything (simplest). For PAC mode, provide rule URLs (see `doc/README.md`), or start from a short link (`./sudoku -link ...`).
 
 ## 5.1) Optional: Cloudflare CDN (orange cloud)
