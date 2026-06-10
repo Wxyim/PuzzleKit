@@ -182,6 +182,21 @@ func handleServerConn(rawConn net.Conn, cfg *config.Config, tables []*sudoku.Tab
 	handleSudokuServerConn(rawConn, rawConn, cfg, tables, true, revMgr)
 }
 
+func newServerDialTarget(cfg *config.Config, factory func(*config.Config) (proxy.Dialer, error)) (func(string) (net.Conn, error), error) {
+	if factory == nil {
+		factory = getOutboundDialer
+	}
+
+	dialer, err := factory(cfg)
+	if err != nil {
+		return nil, err
+	}
+
+	return func(addr string) (net.Conn, error) {
+		return dialer.Dial("tcp", addr)
+	}, nil
+}
+
 func handleSudokuServerConn(handshakeConn net.Conn, rawConn net.Conn, cfg *config.Config, tables []*sudoku.Table, allowFallback bool, revMgr *reverse.Manager) {
 	// Use Tunnel Abstraction for Handshake and Upgrade
 	tunnelConn, meta, err := tunnel.HandshakeAndUpgradeWithTablesMeta(handshakeConn, cfg, tables)
@@ -237,7 +252,14 @@ func handleSudokuServerConn(handshakeConn net.Conn, rawConn net.Conn, cfg *confi
 		logConnect := func(addr string) {
 			logUserInfo("Server/Mux", userHash, "Connecting to %s", addr)
 		}
-		if err := tunnel.HandleMuxServer(tunnelConn, logConnect); err != nil {
+
+		dialTarget, err := newServerDialTarget(cfg, nil)
+		if err != nil {
+			logx.Warnf("Server/Mux", "Outbound setup failed: %v", err)
+			return
+		}
+
+		if err := tunnel.HandleMuxWithDialer(tunnelConn, logConnect, dialTarget); err != nil {
 			logUserWarn("Server/Mux", userHash, "session end: %v", err)
 		} else {
 			logUserInfo("Server/Mux", userHash, "session end")
