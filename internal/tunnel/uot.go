@@ -166,6 +166,9 @@ func HandleUoTServerWithDialer(conn net.Conn, dial func(addr string) (net.Conn, 
 					for {
 						n, err := c.Read(buf)
 						if err != nil {
+							mu.Lock()
+							delete(conns, target)
+							mu.Unlock()
 							closeAll(err)
 							return
 						}
@@ -173,18 +176,22 @@ func HandleUoTServerWithDialer(conn net.Conn, dial func(addr string) (net.Conn, 
 							continue
 						}
 						if err := WriteUoTDatagram(conn, target, buf[:n]); err != nil {
+							mu.Lock()
+							delete(conns, target)
+							mu.Unlock()
 							closeAll(err)
 							return
 						}
 					}
 				}(addrStr, udpConn)
 			}
-			mu.Unlock()
 
 			if _, err := udpConn.Write(payload); err != nil {
+				mu.Unlock()
 				closeAll(err)
 				return
 			}
+			mu.Unlock()
 		}
 	}()
 
