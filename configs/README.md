@@ -37,6 +37,7 @@ Server (basic TCP):
   "padding_max": 15,
   "ascii": "prefer_entropy",
   "enable_pure_downlink": true,
+  "multiplex": "off",
   "httpmask": { "disable": false, "mode": "auto" }
 }
 ```
@@ -53,6 +54,7 @@ Client (basic TCP):
   "padding_max": 15,
   "ascii": "prefer_entropy",
   "enable_pure_downlink": true,
+  "multiplex": "off",
   "httpmask": { "disable": false, "mode": "ws" },
   "rule_urls": ["global"]
 }
@@ -79,33 +81,40 @@ Client (basic TCP):
 
 ### Sudoku encoding & padding
 - `ascii`:
-  - `"prefer_entropy"` (recommended): both directions prefer entropy
+  - `"prefer_entropy"` (recommended): both directions prefer the low-entropy Sudoku byte layout
   - `"prefer_ascii"`: both directions prefer printable ASCII
-  - `"up_ascii_down_entropy"`: client uplink prefers ASCII, server downlink prefers entropy
-  - `"up_entropy_down_ascii"`: client uplink prefers entropy, server downlink prefers ASCII
+  - `"up_ascii_down_entropy"`: client uplink prefers ASCII, server downlink prefers the low-entropy layout
+  - `"up_entropy_down_ascii"`: client uplink prefers the low-entropy layout, server downlink prefers ASCII
 - `padding_min` / `padding_max`: 0–100 percentage; `padding_max` must be ≥ `padding_min`.
 - `custom_table`: optional layout string like `"xpxvvpvv"` (2×`x`, 2×`p`, 4×`v`).
 - `custom_tables`: optional array of layouts; if non-empty it rotates layouts per connection.
 - Directional mode note:
-  - `custom_table` applies only on the direction whose `ascii` side is `entropy`.
+  - `custom_table` applies only on the direction whose `ascii` side is `entropy` / low-entropy.
   - `custom_tables` also rotates in directional modes; the client sends a table hint during the handshake so the server can select the matching layout.
 - `enable_pure_downlink`:
   - `true`: both directions use classic Sudoku encoding
   - `false`: packed downlink mode to reduce overhead (both ends must match)
 
+### Multiplex
+`multiplex` is a single tunnel-level setting. For compatibility with old configs, it can also still be read from the legacy `httpmask.multiplex` location.
+
+- `"off"`: disable session mux and HTTPMask transport reuse
+- `"auto"`: enable HTTPMask transport reuse when HTTP tunnel modes are used; does not enable session mux
+- `"on"`: enable session mux over raw TCP or HTTPMask
+
 ### HTTP masking / HTTP tunnel
-All HTTP-related knobs live under the `httpmask` object.
+HTTP-related fields live under the `httpmask` object.
 
 Example (CDN/proxy friendly mode):
 ```json
 {
+  "multiplex": "auto",
   "httpmask": {
     "disable": false,
     "mode": "auto",
     "tls": true,
     "host": "example.com",
-    "path_root": "aabbcc",
-    "multiplex": "auto"
+    "path_root": "aabbcc"
   }
 }
 ```
@@ -118,10 +127,6 @@ Example (CDN/proxy friendly mode):
 - `tls` (client only, tunnel modes): set `true` to use HTTPS to the entry.
 - `host` (client only, tunnel modes): override HTTP Host / SNI (optional).
 - `path_root` (optional): first-level path prefix shared by both ends.
-- `multiplex`:
-  - `"off"`: do not reuse connections
-  - `"auto"`: reuse HTTP connections when possible (keep-alive / HTTP/2)
-  - `"on"`: enable a single-tunnel multi-target mux (lower RTT for many connections)
 ### Reverse proxy (expose client services)
 Reverse proxy settings live under the `reverse` object.
 

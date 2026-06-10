@@ -37,6 +37,7 @@
   "padding_max": 15,
   "ascii": "prefer_entropy",
   "enable_pure_downlink": true,
+  "multiplex": "off",
   "httpmask": { "disable": false, "mode": "auto" }
 }
 ```
@@ -53,6 +54,7 @@
   "padding_max": 15,
   "ascii": "prefer_entropy",
   "enable_pure_downlink": true,
+  "multiplex": "off",
   "httpmask": { "disable": false, "mode": "ws" },
   "rule_urls": ["global"]
 }
@@ -79,33 +81,40 @@
 
 ### Sudoku 编码与填充
 - `ascii`：
-  - `"prefer_entropy"`（推荐）：上下行都偏向 entropy
+  - `"prefer_entropy"`（推荐）：上下行都偏向低熵 Sudoku 字节布局
   - `"prefer_ascii"`：上下行都偏向可打印 ASCII
-  - `"up_ascii_down_entropy"`：客户端上行偏向 ASCII，服务端下行偏向 entropy
-  - `"up_entropy_down_ascii"`：客户端上行偏向 entropy，服务端下行偏向 ASCII
+  - `"up_ascii_down_entropy"`：客户端上行偏向 ASCII，服务端下行偏向低熵布局
+  - `"up_entropy_down_ascii"`：客户端上行偏向低熵布局，服务端下行偏向 ASCII
 - `padding_min` / `padding_max`：0–100 的百分比；`padding_max` 必须 ≥ `padding_min`。
 - `custom_table`：可选的布局字符串，例如 `"xpxvvpvv"`（2 个 `x`、2 个 `p`、4 个 `v`）。
 - `custom_tables`：可选的布局列表；非空时会在每条连接中轮换布局。
 - 方向模式补充说明：
-  - `custom_table` 只会作用在 `ascii` 为 `entropy` 的那个方向上。
+  - `custom_table` 只会作用在 `ascii` 为 `entropy` / 低熵的那个方向上。
   - `custom_tables` 在方向模式中同样会按连接轮换；客户端会在握手中携带表提示，服务端据此选择对应布局。
 - `enable_pure_downlink`：
   - `true`：上下行都用经典 Sudoku 编码
-  - `false`：启用带宽优化下行（需要 AEAD 且两端必须一致）
+  - `false`：启用带宽优化下行（两端必须一致）
+
+### Multiplex
+`multiplex` 是单一的隧道级配置项。为了兼容旧配置，也可以继续从旧的 `httpmask.multiplex` 位置读取。
+
+- `"off"`：关闭 session mux 和 HTTPMask 底层连接复用
+- `"auto"`：仅在 HTTP 隧道模式下启用 HTTPMask 底层连接复用；不会启用 session mux
+- `"on"`：启用 session mux，可用于 raw TCP 或 HTTPMask
 
 ### HTTP 伪装 / HTTP 隧道
-所有与 HTTP 相关的字段都集中在 `httpmask` 对象中。
+HTTP 相关字段集中在 `httpmask` 对象中。
 
 示例（更适合走 CDN/反代）：
 ```json
 {
+  "multiplex": "auto",
   "httpmask": {
     "disable": false,
     "mode": "auto",
     "tls": true,
     "host": "example.com",
-    "path_root": "aabbcc",
-    "multiplex": "auto"
+    "path_root": "aabbcc"
   }
 }
 ```
@@ -118,10 +127,6 @@
 - `tls`（仅客户端、且隧道模式）：设为 `true` 表示入口使用 HTTPS。
 - `host`（仅客户端、且隧道模式）：覆盖 HTTP Host / SNI（可选）。
 - `path_root`（可选）：双方约定的一级路径前缀。
-- `multiplex`：
-  - `"off"`：不复用
-  - `"auto"`：尽可能复用底层 HTTP 连接（keep-alive / HTTP/2）
-  - `"on"`：开启单隧道多目标复用（大量短连接时更省 RTT）
 ### 反向代理（把客户端服务暴露到服务端）
 反向代理相关字段在 `reverse` 对象中。
 

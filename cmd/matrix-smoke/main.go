@@ -34,8 +34,10 @@ import (
 	"sync/atomic"
 	"time"
 
-	"github.com/SUDOKU-ASCII/sudoku/apis"
+	"github.com/SUDOKU-ASCII/sudoku/internal/config"
+	"github.com/SUDOKU-ASCII/sudoku/internal/protocol"
 	"github.com/SUDOKU-ASCII/sudoku/internal/tunnel"
+	"github.com/SUDOKU-ASCII/sudoku/pkg/connutil"
 	"github.com/SUDOKU-ASCII/sudoku/pkg/crypto"
 	"github.com/SUDOKU-ASCII/sudoku/pkg/obfs/httpmask"
 	"github.com/SUDOKU-ASCII/sudoku/pkg/obfs/sudoku"
@@ -47,6 +49,7 @@ var (
 	flagTimeout  = flag.Duration("timeout", 10*time.Second, "Per-case timeout")
 	flagQuick    = flag.Bool("quick", false, "Run a smaller representative subset")
 	flagPayload  = flag.Int("payload-kib", 256, "Forward payload size in KiB (used to exercise key updates)")
+	flagMatch    = flag.String("match", "", "Run only cases whose canonical description contains this substring")
 )
 
 type combo struct {
@@ -123,6 +126,35 @@ func getTables(key, asciiMode, setName string) ([]*sudoku.Table, error) {
 	}
 	globalTableCache.Store(k, ts.Tables)
 	return ts.Tables, nil
+}
+
+func newMatrixConfig(mode, key string, tc combo, serverAddr, fallbackAddr string) (*config.Config, error) {
+	tc = tc.canonical()
+	cfg := &config.Config{
+		Mode:               mode,
+		Transport:          "tcp",
+		ServerAddress:      serverAddr,
+		FallbackAddr:       fallbackAddr,
+		Key:                key,
+		AEAD:               "chacha20-poly1305",
+		SuspiciousAction:   "fallback",
+		PaddingMin:         5,
+		PaddingMax:         25,
+		ASCII:              tc.asciiMode,
+		EnablePureDownlink: tc.enablePureDownlink,
+		HTTPMask: config.HTTPMaskConfig{
+			Disable:   !tc.httpmaskEnabled,
+			Mode:      tc.httpmaskMode,
+			TLS:       false,
+			Host:      "",
+			PathRoot:  tc.pathRoot,
+			Multiplex: tc.mux,
+		},
+	}
+	if err := cfg.Finalize(); err != nil {
+		return nil, err
+	}
+	return cfg, nil
 }
 
 func startTCPEchoServer(ctx context.Context) (addr string, closeFn func() error, err error) {
@@ -269,19 +301,28 @@ func proxyBidirectional(a, b net.Conn) {
 	_ = b.Close()
 }
 
-func handleFallbackWithVerbose(rawConn net.Conn, fallbackAddr string, replayPrefix []byte, verbose bool) {
-	if rawConn == nil {
+func handleFallbackConn(wrapper net.Conn, rawConn net.Conn, cfg *config.Config, verbose bool) {
+	if rawConn == nil || cfg == nil || strings.TrimSpace(cfg.FallbackAddr) == "" {
+		if rawConn != nil {
+			_ = rawConn.Close()
+		}
 		return
 	}
+
+	var replay []byte
+	if recorder, ok := wrapper.(interface{ GetBufferedAndRecorded() []byte }); ok {
+		replay = recorder.GetBufferedAndRecorded()
+	}
 	if verbose {
-		snippet := replayPrefix
+		snippet := replay
 		if len(snippet) > 256 {
 			snippet = snippet[:256]
 		}
-		fmt.Fprintf(os.Stderr, "fallback proxy: addr=%s replay=%d bytes snippet=%q\n", fallbackAddr, len(replayPrefix), string(snippet))
+		fmt.Fprintf(os.Stderr, "fallback proxy: addr=%s replay=%d bytes snippet=%q\n", cfg.FallbackAddr, len(replay), string(snippet))
 	}
+
 	_ = rawConn.SetDeadline(time.Now().Add(3 * time.Second))
-	dst, err := net.DialTimeout("tcp", fallbackAddr, 3*time.Second)
+	dst, err := net.DialTimeout("tcp", cfg.FallbackAddr, 3*time.Second)
 	if err != nil {
 		if verbose {
 			fmt.Fprintf(os.Stderr, "fallback proxy: dial failed: %v\n", err)
@@ -292,9 +333,9 @@ func handleFallbackWithVerbose(rawConn net.Conn, fallbackAddr string, replayPref
 	_ = dst.SetDeadline(time.Time{})
 	_ = rawConn.SetDeadline(time.Time{})
 
-	if len(replayPrefix) > 0 {
+	if len(replay) > 0 {
 		_ = dst.SetWriteDeadline(time.Now().Add(2 * time.Second))
-		if err := writeFull(dst, replayPrefix); err != nil {
+		if err := writeFull(dst, replay); err != nil {
 			if verbose {
 				fmt.Fprintf(os.Stderr, "fallback proxy: write failed: %v\n", err)
 			}
@@ -308,13 +349,13 @@ func handleFallbackWithVerbose(rawConn net.Conn, fallbackAddr string, replayPref
 }
 
 type serverHarness struct {
-	ln           net.Listener
-	serverAddr   string
-	fallbackAddr string
-	tunnelSrv    *httpmask.TunnelServer
-	cfgBase      *apis.ProtocolConfig
-	verbose      bool
-	handshakes   atomic.Int64
+	ln         net.Listener
+	serverAddr string
+	cfgBase    *config.Config
+	tables     []*sudoku.Table
+	tunnelSrv  *httpmask.TunnelServer
+	verbose    bool
+	handshakes atomic.Int64
 }
 
 func (s *serverHarness) close() error {
@@ -322,19 +363,6 @@ func (s *serverHarness) close() error {
 		return nil
 	}
 	return s.ln.Close()
-}
-
-func protocolTables(cfg *apis.ProtocolConfig) []*sudoku.Table {
-	if cfg == nil {
-		return nil
-	}
-	if len(cfg.Tables) > 0 {
-		return cfg.Tables
-	}
-	if cfg.Table != nil {
-		return []*sudoku.Table{cfg.Table}
-	}
-	return nil
 }
 
 func (s *serverHarness) serve(ctx context.Context) error {
@@ -372,6 +400,7 @@ func (s *serverHarness) handleConn(rawConn net.Conn) {
 
 	handshakeConn := rawConn
 	cfg := *s.cfgBase
+	allowFallback := true
 
 	if s.tunnelSrv != nil {
 		res, c, err := s.tunnelSrv.HandleConn(rawConn)
@@ -384,20 +413,13 @@ func (s *serverHarness) handleConn(rawConn net.Conn) {
 			return
 		case httpmask.HandleStartTunnel:
 			handshakeConn = c
-			cfg.DisableHTTPMask = true
+			cfg.HTTPMask.Disable = true
+			allowFallback = false
 		case httpmask.HandlePassThrough:
 			handshakeConn = c
 			if r, ok := c.(interface{ IsHTTPMaskRejected() bool }); ok && r.IsHTTPMaskRejected() {
 				if s.verbose {
-					_ = c.SetReadDeadline(time.Now().Add(250 * time.Millisecond))
-					buf := make([]byte, 1024)
-					n, _ := c.Read(buf)
-					_ = c.SetReadDeadline(time.Time{})
-					if n > 0 {
-						fmt.Fprintf(os.Stderr, "httpmask rejected (prefix): %q\n", string(buf[:n]))
-					} else {
-						fmt.Fprintf(os.Stderr, "httpmask rejected (no prefix bytes)\n")
-					}
+					fmt.Fprintf(os.Stderr, "httpmask rejected; closing\n")
 				}
 				_ = c.Close()
 				return
@@ -408,110 +430,94 @@ func (s *serverHarness) handleConn(rawConn net.Conn) {
 		}
 	}
 
+	s.handleSudokuConn(handshakeConn, rawConn, &cfg, allowFallback)
+}
+
+func (s *serverHarness) handleSudokuConn(handshakeConn net.Conn, rawConn net.Conn, cfg *config.Config, allowFallback bool) {
 	s.handshakes.Add(1)
-	conn, session, targetAddr, _, payload, err := apis.ServerHandshakeSessionAutoWithUserHash(handshakeConn, &cfg)
+	tunnelConn, _, err := tunnel.HandshakeAndUpgradeWithTablesMeta(handshakeConn, cfg, s.tables)
 	if err != nil {
 		if s.verbose {
 			fmt.Fprintf(os.Stderr, "server handshake error: %T: %v\n", err, err)
 		}
-		var hsErr *apis.HandshakeError
-		if errors.As(err, &hsErr) && hsErr != nil {
-			replay := append(append([]byte(nil), hsErr.HTTPHeaderData...), hsErr.ReadData...)
-			handleFallbackWithVerbose(hsErr.RawConn, s.fallbackAddr, replay, s.verbose)
+		if suspErr, ok := err.(*tunnel.SuspiciousError); ok && allowFallback {
+			handleFallbackConn(suspErr.Conn, rawConn, cfg, s.verbose)
 			return
 		}
 		_ = rawConn.Close()
 		return
 	}
 
-	switch session {
-	case apis.SessionForward:
-		dst, err := net.DialTimeout("tcp", targetAddr, 5*time.Second)
+	msg, err := readFirstSessionMessage(tunnelConn)
+	if err != nil {
+		_ = tunnelConn.Close()
+		return
+	}
+
+	switch msg.Type {
+	case tunnel.KIPTypeOpenTCP:
+		targetAddr, _, _, err := protocol.ReadAddress(bytes.NewReader(msg.Payload))
 		if err != nil {
-			_ = conn.Close()
+			_ = tunnelConn.Close()
 			return
 		}
-		// Inline proxy here so we can surface tunnel-level errors under -v.
-		tryCloseWrite := func(c net.Conn) {
-			if c == nil {
-				return
-			}
-			if cw, ok := c.(interface{ CloseWrite() error }); ok {
-				_ = cw.CloseWrite()
-				return
-			}
-			_ = c.Close()
+		dst, err := net.DialTimeout("tcp", targetAddr, 5*time.Second)
+		if err != nil {
+			_ = tunnelConn.Close()
+			return
 		}
-
-		var wg sync.WaitGroup
-		var e1, e2 error
-		wg.Add(2)
-		go func() {
-			defer wg.Done()
-			_, e1 = io.Copy(dst, conn)
-			tryCloseWrite(dst)
-		}()
-		go func() {
-			defer wg.Done()
-			_, e2 = io.Copy(conn, dst)
-			tryCloseWrite(conn)
-		}()
-		wg.Wait()
-		_ = conn.Close()
-		_ = dst.Close()
-
-		if s.verbose {
-			if e1 != nil {
-				fmt.Fprintf(os.Stderr, "server forward copy (tunnel->target) error: %v\n", e1)
-			}
-			if e2 != nil {
-				fmt.Fprintf(os.Stderr, "server forward copy (target->tunnel) error: %v\n", e2)
-			}
-		}
-	case apis.SessionMux:
-		_ = tunnel.HandleMuxServer(conn, nil)
-	case apis.SessionUoT:
-		_ = tunnel.HandleUoTServer(conn)
-	case apis.SessionReverse:
-		// For smoke runs we only validate that the control plane can reach this state.
-		_ = payload
-		_ = conn.Close()
+		connutil.PipeConn(tunnelConn, dst)
+	case tunnel.KIPTypeStartMux:
+		_ = tunnel.HandleMuxServer(tunnelConn, nil)
+	case tunnel.KIPTypeStartUoT:
+		_ = tunnel.HandleUoTServer(tunnelConn)
+	case tunnel.KIPTypeStartRev:
+		_ = tunnelConn.Close()
 	default:
-		_ = conn.Close()
+		_ = tunnelConn.Close()
 	}
 }
 
-func startSudokuServer(ctx context.Context, baseCfg *apis.ProtocolConfig, fallbackAddr string, verbose bool) (*serverHarness, error) {
+func readFirstSessionMessage(conn net.Conn) (*tunnel.KIPMessage, error) {
+	for {
+		msg, err := tunnel.ReadKIPMessage(conn)
+		if err != nil {
+			return nil, err
+		}
+		if msg.Type != tunnel.KIPTypeKeepAlive {
+			return msg, nil
+		}
+	}
+}
+
+func startSudokuServer(ctx context.Context, baseCfg *config.Config, tables []*sudoku.Table, verbose bool) (*serverHarness, error) {
 	ln, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
 		return nil, err
 	}
 
 	h := &serverHarness{
-		ln:           ln,
-		serverAddr:   ln.Addr().String(),
-		fallbackAddr: fallbackAddr,
-		cfgBase:      baseCfg,
-		verbose:      verbose,
+		ln:         ln,
+		serverAddr: ln.Addr().String(),
+		cfgBase:    baseCfg,
+		tables:     tables,
+		verbose:    verbose,
 	}
 
-	if !baseCfg.DisableHTTPMask {
-		switch strings.ToLower(strings.TrimSpace(baseCfg.HTTPMaskMode)) {
-		case "stream", "poll", "auto", "ws":
-			h.tunnelSrv = httpmask.NewTunnelServer(httpmask.TunnelServerOptions{
-				Mode:     baseCfg.HTTPMaskMode,
-				PathRoot: baseCfg.HTTPMaskPathRoot,
-				AuthKey:  baseCfg.Key,
-				EarlyHandshake: tunnel.NewHTTPMaskServerEarlyHandshake(tunnel.EarlyCodecConfig{
-					PSK:                baseCfg.Key,
-					AEAD:               baseCfg.AEADMethod,
-					EnablePureDownlink: baseCfg.EnablePureDownlink,
-					PaddingMin:         baseCfg.PaddingMin,
-					PaddingMax:         baseCfg.PaddingMax,
-				}, protocolTables(baseCfg), nil),
-				PassThroughOnReject: true,
-			})
-		}
+	if baseCfg.HTTPMaskTunnelEnabled() {
+		h.tunnelSrv = httpmask.NewTunnelServer(httpmask.TunnelServerOptions{
+			Mode:     baseCfg.HTTPMask.Mode,
+			PathRoot: baseCfg.HTTPMask.PathRoot,
+			AuthKey:  baseCfg.Key,
+			EarlyHandshake: tunnel.NewHTTPMaskServerEarlyHandshake(tunnel.EarlyCodecConfig{
+				PSK:                baseCfg.Key,
+				AEAD:               baseCfg.AEAD,
+				EnablePureDownlink: baseCfg.EnablePureDownlink,
+				PaddingMin:         baseCfg.PaddingMin,
+				PaddingMax:         baseCfg.PaddingMax,
+			}, tables, nil),
+			PassThroughOnReject: true,
+		})
 	}
 
 	go func() { _ = h.serve(ctx) }()
@@ -531,8 +537,6 @@ func smokeFallback(ctx context.Context, serverAddr string) error {
 	if _, err := io.WriteString(c, req); err != nil {
 		return err
 	}
-
-	// Encourage fast handshake failure paths in cases without an HTTP tunnel server.
 	if cw, ok := c.(interface{ CloseWrite() error }); ok {
 		_ = cw.CloseWrite()
 	}
@@ -548,8 +552,14 @@ func smokeFallback(ctx context.Context, serverAddr string) error {
 	return nil
 }
 
-func smokeForward(ctx context.Context, cfg *apis.ProtocolConfig, msgSize int) error {
-	c, err := apis.Dial(ctx, cfg)
+func smokeForward(ctx context.Context, cfg *config.Config, tables []*sudoku.Table, targetAddr string, msgSize int) error {
+	dialer := &tunnel.StandardDialer{
+		BaseDialer: tunnel.BaseDialer{
+			Config: cfg,
+			Tables: tables,
+		},
+	}
+	c, err := dialer.Dial(targetAddr)
 	if err != nil {
 		return err
 	}
@@ -565,6 +575,7 @@ func smokeForward(ctx context.Context, cfg *apis.ProtocolConfig, msgSize int) er
 		return err
 	}
 	_ = c.SetWriteDeadline(time.Time{})
+
 	got := make([]byte, len(payload))
 	_ = c.SetReadDeadline(time.Now().Add(6 * time.Second))
 	readN := 0
@@ -575,9 +586,6 @@ func smokeForward(ctx context.Context, cfg *apis.ProtocolConfig, msgSize int) er
 		}
 		if err != nil {
 			_ = c.SetReadDeadline(time.Time{})
-			if err == io.EOF {
-				return fmt.Errorf("read %d/%d: %w", readN, len(got), err)
-			}
 			return fmt.Errorf("read %d/%d: %w", readN, len(got), err)
 		}
 	}
@@ -585,22 +593,36 @@ func smokeForward(ctx context.Context, cfg *apis.ProtocolConfig, msgSize int) er
 	if !bytes.Equal(got, payload) {
 		return fmt.Errorf("echo mismatch")
 	}
+	_ = ctx
 	return nil
 }
 
-func smokeMux(ctx context.Context, base *apis.ProtocolConfig, target1, target2 string) error {
-	mc, err := apis.NewMuxClient(base)
+func smokeMux(ctx context.Context, cfg *config.Config, tables []*sudoku.Table, target1, target2 string) error {
+	base := tunnel.BaseDialer{
+		Config: cfg,
+		Tables: tables,
+	}
+	baseConn, err := base.DialBase()
 	if err != nil {
+		return err
+	}
+	if err := tunnel.WriteKIPMessage(baseConn, tunnel.KIPTypeStartMux, nil); err != nil {
+		_ = baseConn.Close()
+		return fmt.Errorf("start mux failed: %w", err)
+	}
+	mc, err := tunnel.NewMuxClient(baseConn)
+	if err != nil {
+		_ = baseConn.Close()
 		return err
 	}
 	defer mc.Close()
 
-	c1, err := mc.Dial(ctx, target1)
+	c1, err := mc.Dial(target1)
 	if err != nil {
 		return err
 	}
 	defer c1.Close()
-	c2, err := mc.Dial(ctx, target2)
+	c2, err := mc.Dial(target2)
 	if err != nil {
 		return err
 	}
@@ -619,6 +641,7 @@ func smokeMux(ctx context.Context, base *apis.ProtocolConfig, target1, target2 s
 	}
 	_ = c1.SetWriteDeadline(time.Time{})
 	_ = c2.SetWriteDeadline(time.Time{})
+
 	r1 := make([]byte, len(p1))
 	r2 := make([]byte, len(p2))
 	_ = c1.SetReadDeadline(time.Now().Add(6 * time.Second))
@@ -634,6 +657,7 @@ func smokeMux(ctx context.Context, base *apis.ProtocolConfig, target1, target2 s
 	if !bytes.Equal(r1, p1) || !bytes.Equal(r2, p2) {
 		return fmt.Errorf("mux echo mismatch")
 	}
+	_ = ctx
 	return nil
 }
 
@@ -667,24 +691,11 @@ func runOne(tc combo) error {
 		return fmt.Errorf("tables: %w", err)
 	}
 
-	serverCfg := apis.DefaultConfig()
-	serverCfg.ServerAddress = ""
-	serverCfg.TargetAddress = ""
-	serverCfg.Key = seedKey
-	serverCfg.AEADMethod = "chacha20-poly1305"
-	serverCfg.Tables = tables
-	serverCfg.PaddingMin = 5
-	serverCfg.PaddingMax = 25
-	serverCfg.EnablePureDownlink = tc.enablePureDownlink
-	serverCfg.HandshakeTimeoutSeconds = 5
-	serverCfg.DisableHTTPMask = !tc.httpmaskEnabled
-	serverCfg.HTTPMaskMode = tc.httpmaskMode
-	serverCfg.HTTPMaskTLSEnabled = false
-	serverCfg.HTTPMaskHost = ""
-	serverCfg.HTTPMaskPathRoot = tc.pathRoot
-	serverCfg.HTTPMaskMultiplex = tc.mux
-
-	srv, err := startSudokuServer(lifeCtx, serverCfg, fallbackAddr, verbose)
+	serverCfg, err := newMatrixConfig("server", seedKey, tc, "", fallbackAddr)
+	if err != nil {
+		return fmt.Errorf("server config: %w", err)
+	}
+	srv, err := startSudokuServer(lifeCtx, serverCfg, tables, verbose)
 	if err != nil {
 		return fmt.Errorf("start server: %w", err)
 	}
@@ -696,9 +707,10 @@ func runOne(tc combo) error {
 		return fmt.Errorf("fallback smoke: %w", err)
 	}
 
-	clientCfg := *serverCfg
-	clientCfg.ServerAddress = srv.serverAddr
-	clientCfg.TargetAddress = echo1
+	clientCfg, err := newMatrixConfig("client", seedKey, tc, srv.serverAddr, "")
+	if err != nil {
+		return fmt.Errorf("client config: %w", err)
+	}
 
 	oldKU := atomic.LoadInt64(&crypto.KeyUpdateAfterBytes)
 	atomic.StoreInt64(&crypto.KeyUpdateAfterBytes, 32<<10) // 32 KiB (smoke)
@@ -710,19 +722,17 @@ func runOne(tc combo) error {
 	if payloadSize <= 0 {
 		payloadSize = 256 << 10
 	}
-	if err := smokeForward(fwdCtx, &clientCfg, payloadSize); err != nil { // large payload triggers key updates
+	if err := smokeForward(fwdCtx, clientCfg, tables, echo1, payloadSize); err != nil {
 		return fmt.Errorf("forward smoke: %w", err)
 	}
 
 	if tc.mux == "on" {
-		clientCfg.TargetAddress = ""
 		muxCtx, muxCancel := context.WithTimeout(context.Background(), timeout)
 		defer muxCancel()
-		if err := smokeMux(muxCtx, &clientCfg, echo1, echo2); err != nil {
+		if err := smokeMux(muxCtx, clientCfg, tables, echo1, echo2); err != nil {
 			return fmt.Errorf("mux smoke: %w", err)
 		}
 		if got := srv.handshakes.Load(); got > 3 {
-			// forward (1) + mux base (1) + fallback (1) => allow small overhead
 			return fmt.Errorf("unexpected handshake count: %d", got)
 		}
 	}
@@ -772,9 +782,13 @@ func combos(quick bool) []combo {
 func dedupeCombos(all []combo) []combo {
 	seen := make(map[string]struct{}, len(all))
 	dedup := make([]combo, 0, len(all))
+	match := strings.TrimSpace(*flagMatch)
 	for _, c := range all {
 		cc := c.canonical()
 		key := cc.String()
+		if match != "" && !strings.Contains(key, match) {
+			continue
+		}
 		if _, ok := seen[key]; ok {
 			continue
 		}

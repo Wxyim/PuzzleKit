@@ -25,15 +25,28 @@ import (
 	"net"
 
 	"github.com/SUDOKU-ASCII/sudoku/internal/protocol"
+	"github.com/SUDOKU-ASCII/sudoku/pkg/connutil"
 )
 
 func writeKIPOpenTCP(conn net.Conn, addr string) error {
 	if conn == nil {
 		return fmt.Errorf("nil conn")
 	}
+	msg, err := encodeKIPOpenTCP(addr)
+	if err != nil {
+		return err
+	}
+	return connutil.WriteFull(conn, msg)
+}
+
+func encodeKIPOpenTCP(addr string) ([]byte, error) {
 	var b bytes.Buffer
 	if err := protocol.WriteAddress(&b, addr); err != nil {
-		return fmt.Errorf("encode address failed: %w", err)
+		return nil, fmt.Errorf("encode address failed: %w", err)
 	}
-	return WriteKIPMessage(conn, KIPTypeOpenTCP, b.Bytes())
+	var msg bytes.Buffer
+	if err := WriteKIPMessage(&msg, KIPTypeOpenTCP, b.Bytes()); err != nil {
+		return nil, err
+	}
+	return msg.Bytes(), nil
 }

@@ -8,7 +8,7 @@ Docs map:
 - 更新日志（中文）：[doc/CHANGELOG.zh.md](./CHANGELOG.zh.md)
 
 ## Overview
-- **What it is**: TCP tunnel with HTTP masking, Sudoku ASCII/entropy obfuscation, and AEAD encryption; optional bandwidth-optimized downlink plus UoT (UDP-over-TCP).
+- **What it is**: TCP tunnel with HTTP masking, Sudoku ASCII/low-entropy obfuscation, and AEAD encryption; optional bandwidth-optimized downlink plus UoT (UDP-over-TCP).
 - **Binaries**: single `sudoku` entry; configs in JSON; optional `sudoku://` short links for quick client bootstrap.
 - **Ports**: server `local_port` is the public listening port; client `local_port` is the local mixed HTTP/SOCKS proxy port; UDP is relayed via the tunnel (UoT).
 
@@ -32,7 +32,7 @@ Docs map:
 
 ## Protocol (Layers & Principle)
 - **HTTP mask**: random-looking HTTP request on connect.
-- **Sudoku obfuscation**: bytes encoded as 4×4 Sudoku hints; `prefer_ascii` keeps output printable, `prefer_entropy` maximizes entropy.
+- **Sudoku obfuscation**: bytes encoded as 4×4 Sudoku hints; `prefer_ascii` keeps output printable, `prefer_entropy` uses the low-entropy byte layout.
 - **AEAD**: `chacha20-poly1305` (default), `aes-128-gcm`, or `none` (test only); key hashed with SHA-256 to derive cipher key.
 - **Handshake**: timestamp + nonce; server validates time skew and mode.
 - **Downlink modes**: pure Sudoku (default) or packed 6-bit downlink (`enable_pure_downlink=false`).
@@ -189,7 +189,7 @@ Sudoku can run through a CDN/proxy only in real HTTP tunnel modes: `stream` / `p
 
 - Server: set `"httpmask": { "disable": false, "mode": "poll" }` (or `"auto"`).
 - Client: same, and set `"server_address": "your.domain.com:443"` (or other Cloudflare-supported HTTP(S) ports like `8080`/`8443`).
-- Recommended: set `"httpmask": { "multiplex": "auto" }` to reuse one tunnel connection for multiple target streams (lower RTT for subsequent connections).
+- Recommended for HTTP tunnel modes: set top-level `"multiplex": "auto"` to reuse underlying HTTP connections. Use `"multiplex": "on"` only when you want session mux over one raw TCP or HTTPMask tunnel.
 - Set `"httpmask": { "tls": true }` to use HTTPS to the CDN edge (no port-based inference).
 
 Notes:
@@ -234,7 +234,7 @@ WantedBy=multi-user.target
   - `hm` HTTP mask mode: `legacy` / `stream` / `poll` / `auto` / `ws` (optional)
   - `ht` force HTTPS in tunnel modes (optional)
   - `hh` HTTP Host/SNI override in tunnel modes (optional)
-  - `hx` HTTP mask multiplex: `off` / `auto` / `on` (optional)
+  - `hx` multiplex compatibility field: `off` / `auto` / `on` (optional)
   - `hy` HTTP mask path root prefix (optional)
 - Example: `sudoku://eyJoIjoiZXhhbXBsZS5jb20iLCJwIjo4MDgwLCJrIjoiYWJjZCIsImEiOiJhc2NpaSIsIm0iOjEwODAsIm1wIjoyMDEyM30`
 - Client bootstrap: `./sudoku -link "<link>"` (starts PAC proxy).
@@ -245,7 +245,7 @@ WantedBy=multi-user.target
 <a name="zh"></a>
 
 ## 概览
-- **功能**：HTTP 伪装 + 数独 ASCII/高熵混淆 + AEAD 加密，可选带宽优化下行。
+- **功能**：HTTP 伪装 + 数独 ASCII/低熵混淆 + AEAD 加密，可选带宽优化下行。
 - **形态**：单二进制 `sudoku`，JSON 配置；可用 `sudoku://` 短链接直接启动客户端。
 - **端口**：服务端 `local_port` 是对外监听端口；客户端 `local_port` 是本地混合 HTTP/SOCKS 代理端口；UDP 通过隧道（UoT）转发。
 
@@ -269,7 +269,7 @@ WantedBy=multi-user.target
 
 ## 协议定义与原理
 - **HTTP 伪装**：建立连接时先发随机化 HTTP 请求头。
-- **数独混淆**：每字节编码为 4×4 数独提示；`prefer_ascii` 输出可打印字符，`prefer_entropy` 输出高熵字节。
+- **数独混淆**：每字节编码为 4×4 数独提示；`prefer_ascii` 输出可打印字符，`prefer_entropy` 使用低熵字节布局。
 - **AEAD 加密**：`chacha20-poly1305`（默认）/`aes-128-gcm`/`none`（仅测试）；密钥经 SHA-256 派生。
 - **握手**：时间戳 + nonce；服务端校验时间偏差与模式是否一致。
 - **下行模式**：默认纯数独下行；`enable_pure_downlink=false` 启用 6bit 拆分下行。
@@ -423,7 +423,7 @@ Sudoku 只有在真实 HTTP 隧道模式下才能过 CDN/代理：`stream` / `po
 
 - 服务端：设置 `"httpmask": { "disable": false, "mode": "poll" }`（或 `"auto"`）。
 - 客户端：同样开启 HTTP mask，并将 `"server_address"` 填成 Cloudflare 域名（如 `"your.domain.com:443"`；也可用 Cloudflare 支持的 `8080`/`8443` 等端口）。
-- 建议同时开启 `"httpmask": { "multiplex": "auto" }`（复用单条隧道连接承载多条目标流，降低后续连接 RTT）。
+- HTTP 隧道模式建议设置顶层 `"multiplex": "auto"` 以复用底层 HTTP 连接；只有需要 raw TCP 或 HTTPMask 单隧道多目标 session mux 时才使用 `"multiplex": "on"`。
 - 如需使用 HTTPS，请显式设置 `"httpmask": { "tls": true }`（不再按端口自动推断）。
 
 提示：
@@ -453,6 +453,6 @@ Sudoku 只有在真实 HTTP 隧道模式下才能过 CDN/代理：`stream` / `po
   - `hm` HTTP mask 模式：`legacy` / `stream` / `poll` / `auto` / `ws`（可选）
   - `ht` 强制 HTTPS（可选）
   - `hh` tunnel 模式下的 Host/SNI 覆盖（可选）
-  - `hx` HTTP mask 多路复用：`off` / `auto` / `on`（可选）
+  - `hx` multiplex 兼容字段：`off` / `auto` / `on`（可选）
   - `hy` HTTP mask path root 前缀（可选）
 - 启动：`./sudoku -link "<短链>"`；导出：`./sudoku -c client.config.json -export-link [-public-host]`

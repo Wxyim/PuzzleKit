@@ -9,7 +9,9 @@ import (
 	"testing"
 	"time"
 
-	"github.com/SUDOKU-ASCII/sudoku/apis"
+	"github.com/SUDOKU-ASCII/sudoku/internal/config"
+	"github.com/SUDOKU-ASCII/sudoku/internal/tunnel"
+	"github.com/SUDOKU-ASCII/sudoku/pkg/obfs/sudoku"
 )
 
 func TestMatrixSmoke(t *testing.T) {
@@ -83,32 +85,24 @@ func TestHTTPMaskRTTParity(t *testing.T) {
 				t.Fatalf("tables: %v", err)
 			}
 
-			onCfg := apis.DefaultConfig()
-			onCfg.Key = seedKey
-			onCfg.AEADMethod = "chacha20-poly1305"
-			onCfg.Tables = tables
-			onCfg.PaddingMin = 5
-			onCfg.PaddingMax = 25
-			onCfg.EnablePureDownlink = tc.enablePureDownlink
-			onCfg.HandshakeTimeoutSeconds = 5
-			onCfg.DisableHTTPMask = false
-			onCfg.HTTPMaskMode = tc.httpmaskMode
-			onCfg.HTTPMaskPathRoot = tc.pathRoot
-			onCfg.HTTPMaskMultiplex = tc.mux
+			onCfg, err := newMatrixConfig("server", seedKey, tc, "", fallbackAddr)
+			if err != nil {
+				t.Fatalf("httpmask config: %v", err)
+			}
+			offCombo := tc
+			offCombo.httpmaskEnabled = false
+			offCfg, err := newMatrixConfig("server", seedKey, offCombo, "", fallbackAddr)
+			if err != nil {
+				t.Fatalf("baseline config: %v", err)
+			}
 
-			offCfg := *onCfg
-			offCfg.DisableHTTPMask = true
-			offCfg.HTTPMaskMode = "legacy"
-			offCfg.HTTPMaskPathRoot = ""
-			offCfg.HTTPMaskMultiplex = "off"
-
-			onSrv, err := startSudokuServer(ctx, onCfg, fallbackAddr, false)
+			onSrv, err := startSudokuServer(ctx, onCfg, tables, false)
 			if err != nil {
 				t.Fatalf("start httpmask server: %v", err)
 			}
 			defer onSrv.close()
 
-			offSrv, err := startSudokuServer(ctx, &offCfg, fallbackAddr, false)
+			offSrv, err := startSudokuServer(ctx, offCfg, tables, false)
 			if err != nil {
 				t.Fatalf("start baseline server: %v", err)
 			}
@@ -127,21 +121,22 @@ func TestHTTPMaskRTTParity(t *testing.T) {
 			}
 			defer closeOffProxy()
 
-			onClient := *onCfg
-			onClient.ServerAddress = onProxyAddr
-			onClient.TargetAddress = echoAddr
-
-			offClient := offCfg
-			offClient.ServerAddress = offProxyAddr
-			offClient.TargetAddress = echoAddr
+			onClient, err := newMatrixConfig("client", seedKey, tc, onProxyAddr, "")
+			if err != nil {
+				t.Fatalf("httpmask client config: %v", err)
+			}
+			offClient, err := newMatrixConfig("client", seedKey, offCombo, offProxyAddr, "")
+			if err != nil {
+				t.Fatalf("baseline client config: %v", err)
+			}
 
 			warmupRuns := 2
 			sampleRuns := 5
 			for i := 0; i < warmupRuns; i++ {
-				if _, err := measureFirstEchoRTT(context.Background(), &onClient); err != nil {
+				if _, err := measureFirstEchoRTT(context.Background(), onClient, tables, echoAddr); err != nil {
 					t.Fatalf("warm up httpmask rtt: %v", err)
 				}
-				if _, err := measureFirstEchoRTT(context.Background(), &offClient); err != nil {
+				if _, err := measureFirstEchoRTT(context.Background(), offClient, tables, echoAddr); err != nil {
 					t.Fatalf("warm up baseline rtt: %v", err)
 				}
 			}
@@ -150,13 +145,13 @@ func TestHTTPMaskRTTParity(t *testing.T) {
 			baselineSamples := make([]time.Duration, 0, sampleRuns)
 			for i := 0; i < sampleRuns; i++ {
 				if i%2 == 0 {
-					enabledDur, err := measureFirstEchoRTT(context.Background(), &onClient)
+					enabledDur, err := measureFirstEchoRTT(context.Background(), onClient, tables, echoAddr)
 					if err != nil {
 						t.Fatalf("measure httpmask rtt: %v", err)
 					}
 					enabledSamples = append(enabledSamples, enabledDur)
 
-					baselineDur, err := measureFirstEchoRTT(context.Background(), &offClient)
+					baselineDur, err := measureFirstEchoRTT(context.Background(), offClient, tables, echoAddr)
 					if err != nil {
 						t.Fatalf("measure baseline rtt: %v", err)
 					}
@@ -164,13 +159,13 @@ func TestHTTPMaskRTTParity(t *testing.T) {
 					continue
 				}
 
-				baselineDur, err := measureFirstEchoRTT(context.Background(), &offClient)
+				baselineDur, err := measureFirstEchoRTT(context.Background(), offClient, tables, echoAddr)
 				if err != nil {
 					t.Fatalf("measure baseline rtt: %v", err)
 				}
 				baselineSamples = append(baselineSamples, baselineDur)
 
-				enabledDur, err := measureFirstEchoRTT(context.Background(), &onClient)
+				enabledDur, err := measureFirstEchoRTT(context.Background(), onClient, tables, echoAddr)
 				if err != nil {
 					t.Fatalf("measure httpmask rtt: %v", err)
 				}
@@ -220,15 +215,21 @@ func trimmedMeanDuration(samples []time.Duration) time.Duration {
 	return total / time.Duration(len(ordered))
 }
 
-func measureFirstEchoRTT(ctx context.Context, cfg *apis.ProtocolConfig) (time.Duration, error) {
+func measureFirstEchoRTT(ctx context.Context, cfg *config.Config, tables []*sudoku.Table, targetAddr string) (time.Duration, error) {
 	if ctx == nil {
 		ctx = context.Background()
 	}
 	runCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
 	defer cancel()
 
+	dialer := &tunnel.StandardDialer{
+		BaseDialer: tunnel.BaseDialer{
+			Config: cfg,
+			Tables: tables,
+		},
+	}
 	start := time.Now()
-	conn, err := apis.Dial(runCtx, cfg)
+	conn, err := dialer.Dial(targetAddr)
 	if err != nil {
 		return 0, err
 	}
@@ -242,6 +243,7 @@ func measureFirstEchoRTT(ctx context.Context, cfg *apis.ProtocolConfig) (time.Du
 	if _, err := io.ReadFull(conn, b[:]); err != nil {
 		return 0, err
 	}
+	_ = runCtx
 	return time.Since(start), nil
 }
 

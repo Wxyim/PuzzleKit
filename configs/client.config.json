@@ -11,13 +11,13 @@
   "custom_tables": [],
   "ascii": "prefer_entropy",
   "enable_pure_downlink": true,
+  "multiplex": "off",
   "httpmask": {
     "disable": false,
     "mode": "ws",
     "tls": false,
     "host": "",
-    "path_root": "",
-    "multiplex": "off"
+    "path_root": ""
   },
   "rule_urls": [
     "https://fastly.jsdelivr.net/gh/blackmatrix7/ios_rule_script@master/rule/Clash/ChinaMaxNoIP/ChinaMaxNoIP.list",

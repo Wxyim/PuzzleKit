@@ -12,13 +12,13 @@
   "custom_tables": [],
   "ascii": "prefer_entropy",
   "enable_pure_downlink": true,
+  "multiplex": "off",
   "httpmask": {
     "disable": false,
     "mode": "auto",
     "tls": false,
     "host": "",
-    "path_root": "",
-    "multiplex": "off"
+    "path_root": ""
   },
   "reverse": {
     "listen": ""

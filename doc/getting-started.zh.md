@@ -64,13 +64,13 @@ go build -o sudoku ./cmd/sudoku-tunnel
   "padding_max": 15,
   "custom_table": "xpxvvpvv",
   "ascii": "prefer_entropy",
+  "multiplex": "off",
   "httpmask": {
     "disable": false,
     "mode": "legacy",
     "tls": false,
     "host": "",
-    "path_root": "",
-    "multiplex": "off"
+    "path_root": ""
   },
   "rule_urls": ["global"]
 }
@@ -78,6 +78,7 @@ go build -o sudoku ./cmd/sudoku-tunnel
 - 想要看起来更像纯文本：把 `ascii` 改成 `prefer_ascii`，客户端和服务端需一致。
 - 想要自定义字节指纹：添加 `custom_table`（两个 `x`、两个 `p`、四个 `v`，如 `xpxvvpvv`，共 420 种全排列）；若同时配置 ASCII，则 ASCII 优先生效。
 - 想要更好的下行带宽：两端都将 `enable_pure_downlink` 设为 `false`，开启带宽优化下行。
+- Multiplex：HTTP 隧道模式下用 `"multiplex": "auto"` 复用 HTTPMask 底层连接；需要 raw TCP 或 HTTPMask 单隧道多目标 session mux 时用 `"multiplex": "on"`。
 - 分流提示：`rule_urls: ["global"]` 表示全局代理（最省心）。如需 PAC 分流，请配置规则 URL（见 `doc/README.md`），或直接用短链启动（`./sudoku -link ...`）。
 
 ## 5.1（可选）过 Cloudflare CDN（小黄云）
