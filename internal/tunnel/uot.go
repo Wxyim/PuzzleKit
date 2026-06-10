@@ -106,36 +106,42 @@ func ReadUoTDatagram(r io.Reader) (string, []byte, error) {
 
 // HandleUoTServer bridges UDP packets over the already-upgraded tunnel connection.
 func HandleUoTServer(conn net.Conn) error {
-	pConn, err := net.ListenPacket("udp", "")
-	if err != nil {
-		return fmt.Errorf("listen udp for uot: %w", err)
+	return HandleUoTServerWithDialer(conn, nil)
+}
+
+// HandleUoTServerWithDialer bridges UDP packets over the already-upgraded tunnel connection
+// using the provided UDP target dialer.
+func HandleUoTServerWithDialer(conn net.Conn, dial func(addr string) (net.Conn, error)) error {
+	if conn == nil {
+		return fmt.Errorf("nil conn")
 	}
+	if dial == nil {
+		dial = func(addr string) (net.Conn, error) {
+			udpAddr, err := net.ResolveUDPAddr("udp", addr)
+			if err != nil {
+				return nil, err
+			}
+			return net.DialUDP("udp", nil, udpAddr)
+		}
+	}
+
+	var mu sync.Mutex
+	conns := make(map[string]net.Conn)
 
 	errCh := make(chan error, 1)
 	var once sync.Once
 
 	closeAll := func(err error) {
 		once.Do(func() {
+			mu.Lock()
+			for _, c := range conns {
+				_ = c.Close()
+			}
+			mu.Unlock()
 			_ = conn.Close()
-			_ = pConn.Close()
 			errCh <- err
 		})
 	}
-
-	go func() {
-		buf := make([]byte, maxUoTPayload)
-		for {
-			n, addr, err := pConn.ReadFrom(buf)
-			if err != nil {
-				closeAll(err)
-				return
-			}
-			if err := WriteUoTDatagram(conn, addr.String(), buf[:n]); err != nil {
-				closeAll(err)
-				return
-			}
-		}
-	}()
 
 	go func() {
 		for {
@@ -144,12 +150,38 @@ func HandleUoTServer(conn net.Conn) error {
 				closeAll(err)
 				return
 			}
-			udpAddr, err := net.ResolveUDPAddr("udp", addrStr)
-			if err != nil {
-				// Skip invalid destinations instead of failing the whole session.
-				continue
+
+			mu.Lock()
+			udpConn, ok := conns[addrStr]
+			if !ok {
+				udpConn, err = dial(addrStr)
+				if err != nil {
+					mu.Unlock()
+					// Skip invalid destinations instead of failing the whole session.
+					continue
+				}
+				conns[addrStr] = udpConn
+				go func(target string, c net.Conn) {
+					buf := make([]byte, maxUoTPayload)
+					for {
+						n, err := c.Read(buf)
+						if err != nil {
+							closeAll(err)
+							return
+						}
+						if n == 0 {
+							continue
+						}
+						if err := WriteUoTDatagram(conn, target, buf[:n]); err != nil {
+							closeAll(err)
+							return
+						}
+					}
+				}(addrStr, udpConn)
 			}
-			if _, err := pConn.WriteTo(payload, udpAddr); err != nil {
+			mu.Unlock()
+
+			if _, err := udpConn.Write(payload); err != nil {
 				closeAll(err)
 				return
 			}

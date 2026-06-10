@@ -9,12 +9,16 @@ import (
 )
 
 type fakeDialer struct {
-	called bool
-	conn   net.Conn
+	called      bool
+	lastNetwork string
+	lastAddr    string
+	conn        net.Conn
 }
 
 func (f *fakeDialer) Dial(network, addr string) (net.Conn, error) {
 	f.called = true
+	f.lastNetwork = network
+	f.lastAddr = addr
 	if f.conn == nil {
 		client, _ := net.Pipe()
 		f.conn = client
@@ -27,7 +31,7 @@ func TestNewServerDialTarget_UsesProvidedDialer(t *testing.T) {
 
 	dialTarget, err := newServerDialTarget(&config.Config{}, func(*config.Config) (proxy.Dialer, error) {
 		return fake, nil
-	})
+	}, "udp")
 	if err != nil {
 		t.Fatalf("newServerDialTarget() error = %v", err)
 	}
@@ -41,6 +45,12 @@ func TestNewServerDialTarget_UsesProvidedDialer(t *testing.T) {
 	}
 	if !fake.called {
 		t.Fatal("expected provided dialer to be used")
+	}
+	if fake.lastNetwork != "udp" {
+		t.Fatalf("expected udp dialer network, got %q", fake.lastNetwork)
+	}
+	if fake.lastAddr != "example.com:443" {
+		t.Fatalf("expected target address to be preserved, got %q", fake.lastAddr)
 	}
 	_ = conn.Close()
 }

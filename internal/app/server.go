@@ -182,9 +182,12 @@ func handleServerConn(rawConn net.Conn, cfg *config.Config, tables []*sudoku.Tab
 	handleSudokuServerConn(rawConn, rawConn, cfg, tables, true, revMgr)
 }
 
-func newServerDialTarget(cfg *config.Config, factory func(*config.Config) (proxy.Dialer, error)) (func(string) (net.Conn, error), error) {
+func newServerDialTarget(cfg *config.Config, factory func(*config.Config) (proxy.Dialer, error), network string) (func(string) (net.Conn, error), error) {
 	if factory == nil {
 		factory = getOutboundDialer
+	}
+	if strings.TrimSpace(network) == "" {
+		network = "tcp"
 	}
 
 	dialer, err := factory(cfg)
@@ -193,7 +196,7 @@ func newServerDialTarget(cfg *config.Config, factory func(*config.Config) (proxy
 	}
 
 	return func(addr string) (net.Conn, error) {
-		return dialer.Dial("tcp", addr)
+		return dialer.Dial(network, addr)
 	}, nil
 }
 
@@ -241,7 +244,14 @@ func handleSudokuServerConn(handshakeConn net.Conn, rawConn net.Conn, cfg *confi
 	switch msg.Type {
 	case tunnel.KIPTypeStartUoT:
 		logUserInfo("Server/UoT", userHash, "session start")
-		if err := tunnel.HandleUoTServer(tunnelConn); err != nil {
+
+		dialTarget, err := newServerDialTarget(cfg, nil, "udp")
+		if err != nil {
+			logx.Warnf("Server/UoT", "Outbound setup failed: %v", err)
+			return
+		}
+
+		if err := tunnel.HandleUoTServerWithDialer(tunnelConn, dialTarget); err != nil {
 			logUserWarn("Server/UoT", userHash, "session end: %v", err)
 		} else {
 			logUserInfo("Server/UoT", userHash, "session end")
@@ -253,7 +263,7 @@ func handleSudokuServerConn(handshakeConn net.Conn, rawConn net.Conn, cfg *confi
 			logUserInfo("Server/Mux", userHash, "Connecting to %s", addr)
 		}
 
-		dialTarget, err := newServerDialTarget(cfg, nil)
+		dialTarget, err := newServerDialTarget(cfg, nil, "tcp")
 		if err != nil {
 			logx.Warnf("Server/Mux", "Outbound setup failed: %v", err)
 			return
