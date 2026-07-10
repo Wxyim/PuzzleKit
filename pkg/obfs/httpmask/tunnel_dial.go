@@ -33,13 +33,13 @@ import (
 	"strings"
 	"sync"
 	"time"
-
-	"github.com/SUDOKU-ASCII/sudoku/pkg/dnsutil"
 )
 
 const (
-	tunnelEarlyDataQueryKey = "ed"
-	tunnelEarlyDataHeader   = "X-Sudoku-Early"
+	tunnelEarlyDataQueryKey   = "ed"
+	tunnelEarlyDataHeader     = "X-Sudoku-Early"
+	tunnelPreconnectCount     = 3
+	tunnelTLSHandshakeTimeout = 10 * time.Second
 )
 
 type authorizeResponse struct {
@@ -159,11 +159,48 @@ type transportKey struct {
 }
 
 type transportCacheEntry struct {
-	key transportKey
-	tr  *http.Transport
+	key       transportKey
+	transport *tunnelHTTPTransport
 }
 
-// transportCache bounds the memory footprint of globally reused *http.Transport instances.
+type tunnelHTTPTransport struct {
+	transport *http.Transport
+	dialer    *preconnectDialer
+}
+
+func (t *tunnelHTTPTransport) close() {
+	if t == nil {
+		return
+	}
+	if t.transport != nil {
+		t.transport.CloseIdleConnections()
+	}
+	if t.dialer != nil {
+		t.dialer.close()
+	}
+}
+
+type tunnelHTTPClient struct {
+	client    *http.Client
+	transport *tunnelHTTPTransport
+}
+
+func (c *tunnelHTTPClient) preconnect(ctx context.Context, req *http.Request, count int) context.CancelFunc {
+	if c == nil || c.transport == nil || c.transport.transport == nil || c.transport.dialer == nil ||
+		req == nil || req.URL == nil || count <= 0 {
+		return func() {}
+	}
+
+	if proxy := c.transport.transport.Proxy; proxy != nil {
+		proxyURL, err := proxy(req)
+		if err != nil || proxyURL != nil {
+			return func() {}
+		}
+	}
+	return c.transport.dialer.preconnect(ctx, req.URL.Scheme == "https", count)
+}
+
+// transportCache bounds the memory footprint of globally reused HTTP transports and dialers.
 //
 // Each dial creates its own http.Client, but clients can share Transports to reuse
 // underlying TCP/TLS connections (keep-alive / HTTP/2) when Multiplex is enabled.
@@ -185,7 +222,10 @@ func newTransportCache(maxEntries int) *transportCache {
 	}
 }
 
-func (c *transportCache) getOrCreate(key transportKey, build func() *http.Transport) *http.Transport {
+func (c *transportCache) getOrCreate(
+	key transportKey,
+	build func() *tunnelHTTPTransport,
+) *tunnelHTTPTransport {
 	if c == nil {
 		return build()
 	}
@@ -194,32 +234,25 @@ func (c *transportCache) getOrCreate(key transportKey, build func() *http.Transp
 	if el := c.m[key]; el != nil {
 		c.ll.MoveToFront(el)
 		ent := el.Value.(*transportCacheEntry)
-		tr := ent.tr
+		transport := ent.transport
 		c.mu.Unlock()
-		if tr == nil {
-			return build()
-		}
-		return tr
+		return transport
 	}
 	c.mu.Unlock()
 
-	tr := build()
+	transport := build()
 
 	c.mu.Lock()
 	// Another goroutine might have inserted while we were building.
 	if el := c.m[key]; el != nil {
 		c.ll.MoveToFront(el)
 		ent := el.Value.(*transportCacheEntry)
-		existing := ent.tr
+		existing := ent.transport
 		c.mu.Unlock()
-		if existing != nil {
-			// We created an extra transport; best-effort close any idle conns then drop it.
-			tr.CloseIdleConnections()
-			return existing
-		}
-		return tr
+		transport.close()
+		return existing
 	}
-	el := c.ll.PushFront(&transportCacheEntry{key: key, tr: tr})
+	el := c.ll.PushFront(&transportCacheEntry{key: key, transport: transport})
 	c.m[key] = el
 	for c.max > 0 && c.ll.Len() > c.max {
 		back := c.ll.Back()
@@ -229,18 +262,30 @@ func (c *transportCache) getOrCreate(key transportKey, build func() *http.Transp
 		ent := back.Value.(*transportCacheEntry)
 		delete(c.m, ent.key)
 		c.ll.Remove(back)
-		if ent.tr != nil {
-			ent.tr.CloseIdleConnections()
-		}
+		ent.transport.close()
 	}
 	c.mu.Unlock()
-	return tr
+	return transport
 }
 
 var globalTransportCache = newTransportCache(128)
 
-func newHTTPClient(urlHost, dialAddr, serverName, scheme string, maxIdleConns int, reuseTransport bool) *http.Client {
-	build := func() *http.Transport {
+func newHTTPClient(
+	urlHost, dialAddr, serverName, scheme string,
+	maxIdleConns int,
+	reuseTransport bool,
+) *tunnelHTTPClient {
+	build := func() *tunnelHTTPTransport {
+		var transportTLSConfig, dialerTLSConfig *tls.Config
+		if scheme == "https" {
+			transportTLSConfig = &tls.Config{
+				ServerName: serverName,
+				MinVersion: tls.VersionTLS12,
+				NextProtos: []string{"h2", "http/1.1"},
+			}
+			dialerTLSConfig = transportTLSConfig.Clone()
+		}
+		dialer := newPreconnectDialer(urlHost, dialAddr, serverName, dialerTLSConfig)
 		transport := &http.Transport{
 			Proxy:                 http.ProxyFromEnvironment,
 			ForceAttemptHTTP2:     scheme == "https",
@@ -249,35 +294,33 @@ func newHTTPClient(urlHost, dialAddr, serverName, scheme string, maxIdleConns in
 			MaxIdleConnsPerHost:   maxIdleConns,
 			IdleConnTimeout:       30 * time.Second,
 			ResponseHeaderTimeout: 20 * time.Second,
-			TLSHandshakeTimeout:   10 * time.Second,
-			DialContext: func(dialCtx context.Context, network, addr string) (net.Conn, error) {
-				d := dnsutil.OutboundDialer(0)
-				if addr == urlHost {
-					addr = dialAddr
-				}
-				return d.DialContext(dialCtx, network, addr)
-			},
+			TLSHandshakeTimeout:   tunnelTLSHandshakeTimeout,
+			DialContext:           dialer.dialContext,
 		}
 		if scheme == "https" {
-			transport.TLSClientConfig = &tls.Config{
-				ServerName: serverName,
-				MinVersion: tls.VersionTLS12,
-			}
+			transport.TLSClientConfig = transportTLSConfig
+			transport.DialTLSContext = dialer.dialTLSContext
 		}
-		return transport
+		return &tunnelHTTPTransport{transport: transport, dialer: dialer}
 	}
 
+	var transport *tunnelHTTPTransport
 	if !reuseTransport {
-		return &http.Client{Transport: build()}
+		transport = build()
+	} else {
+		key := transportKey{
+			scheme:     scheme,
+			urlHost:    urlHost,
+			dialAddr:   dialAddr,
+			serverName: serverName,
+		}
+		transport = globalTransportCache.getOrCreate(key, build)
 	}
 
-	key := transportKey{
-		scheme:     scheme,
-		urlHost:    urlHost,
-		dialAddr:   dialAddr,
-		serverName: serverName,
+	return &tunnelHTTPClient{
+		client:    &http.Client{Transport: transport.transport},
+		transport: transport,
 	}
-	return &http.Client{Transport: globalTransportCache.getOrCreate(key, build)}
 }
 
 func dialSession(ctx context.Context, serverAddress string, opts TunnelDialOptions, mode TunnelMode) (*sessionDialInfo, error) {
@@ -288,7 +331,7 @@ func dialSession(ctx context.Context, serverAddress string, opts TunnelDialOptio
 	headerHost := canonicalHeaderHost(urlHost, scheme)
 	auth := newTunnelAuth(opts.AuthKey, 0)
 
-	client := newHTTPClient(urlHost, dialAddr, serverName, scheme, 32, multiplexEnabled(opts.Multiplex))
+	httpClient := newHTTPClient(urlHost, dialAddr, serverName, scheme, 32, multiplexEnabled(opts.Multiplex))
 
 	authorizeURL := (&url.URL{Scheme: scheme, Host: urlHost, Path: joinPathRoot(opts.PathRoot, "/session")}).String()
 	if opts.EarlyHandshake != nil && len(opts.EarlyHandshake.RequestPayload) > 0 {
@@ -305,7 +348,16 @@ func dialSession(ctx context.Context, serverAddress string, opts TunnelDialOptio
 	applyTunnelHeaders(req.Header, headerHost, mode)
 	applyTunnelAuth(req, auth, mode, http.MethodGet, "/session")
 
-	resp, err := client.Do(req)
+	// Overlap the authorization, initial pull, and initial push connection handshakes.
+	cancelPreconnect := httpClient.preconnect(ctx, req, tunnelPreconnectCount)
+	keepPreconnected := false
+	defer func() {
+		if !keepPreconnected {
+			cancelPreconnect()
+		}
+	}()
+
+	resp, err := httpClient.client.Do(req)
 	if err != nil {
 		return nil, err
 	}
@@ -336,9 +388,10 @@ func dialSession(ctx context.Context, serverAddress string, opts TunnelDialOptio
 	pullURL := (&url.URL{Scheme: scheme, Host: urlHost, Path: joinPathRoot(opts.PathRoot, "/stream"), RawQuery: "token=" + url.QueryEscape(token)}).String()
 	finURL := (&url.URL{Scheme: scheme, Host: urlHost, Path: joinPathRoot(opts.PathRoot, "/api/v1/upload"), RawQuery: "token=" + url.QueryEscape(token) + "&fin=1"}).String()
 	closeURL := (&url.URL{Scheme: scheme, Host: urlHost, Path: joinPathRoot(opts.PathRoot, "/api/v1/upload"), RawQuery: "token=" + url.QueryEscape(token) + "&close=1"}).String()
+	keepPreconnected = true
 
 	return &sessionDialInfo{
-		client:     client,
+		client:     httpClient.client,
 		pushURL:    pushURL,
 		pullURL:    pullURL,
 		finURL:     finURL,
