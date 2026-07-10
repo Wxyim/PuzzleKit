@@ -21,11 +21,14 @@ package geodata
 
 import (
 	"bytes"
+	"crypto/sha256"
 	"encoding/binary"
 	"fmt"
 	"io"
 	"net"
 	"net/http"
+	"os"
+	"path/filepath"
 	"sort"
 	"strings"
 	"sync"
@@ -47,6 +50,8 @@ const (
 	lanRange3End   = 3232301055 // 192.168.255.255
 	lanRange4Start = 2130706432 // 127.0.0.0
 	lanRange4End   = 2147483647 // 127.255.255.255
+
+	ruleCacheDirEnv = "SUDOKU_RULE_CACHE_DIR"
 )
 
 // IPRange represents an IP interval [Start, End]
@@ -68,6 +73,7 @@ type Manager struct {
 	domainSuffix  map[string]struct{} // Suffix match: DOMAIN-SUFFIX
 	mu            sync.RWMutex
 	urls          []string
+	cacheDir      string
 }
 
 type Match struct {
@@ -95,19 +101,38 @@ type ruleBuildState struct {
 	suffix  map[string]struct{}
 }
 
-var instances sync.Map
+var (
+	instances       sync.Map
+	ruleCacheFileMu sync.Mutex
+)
 
 var newRuleDownloadClient = func() *http.Client {
 	return dnsutil.NewOutboundHTTPClient(30*time.Second, dnsutil.RecommendedClientResolver())
 }
 
 func NewManager(urls []string) *Manager {
+	cacheDir, err := resolveRuleCacheDir()
+	if err != nil {
+		logx.Warnf("GeoData", "Rule cache disabled: %v", err)
+	}
 	return &Manager{
 		urls:          append([]string(nil), urls...),
 		domainExact:   make(map[string]struct{}),
 		domainKeyword: make(map[string]struct{}),
 		domainSuffix:  make(map[string]struct{}),
+		cacheDir:      cacheDir,
 	}
+}
+
+func resolveRuleCacheDir() (string, error) {
+	if dir := strings.TrimSpace(os.Getenv(ruleCacheDirEnv)); dir != "" {
+		return filepath.Clean(dir), nil
+	}
+	root, err := os.UserCacheDir()
+	if err != nil {
+		return "", err
+	}
+	return filepath.Join(root, "sudoku", "geodata"), nil
 }
 
 func newRuleBuildState() *ruleBuildState {
@@ -190,54 +215,144 @@ func cloneRuleSet(src map[string]struct{}) map[string]struct{} {
 }
 
 func (m *Manager) downloadAndParse(url string, state *ruleBuildState) bool {
+	body, refreshErr := downloadRuleSource(url)
+	if refreshErr == nil {
+		if parseRuleSource(body, state) {
+			if m.cacheDir != "" {
+				if err := m.writeRuleCache(url, body); err != nil {
+					logx.Warnf("GeoData", "Rules loaded from %s, but cache update failed: %v", url, err)
+				}
+			}
+			return true
+		}
+		refreshErr = fmt.Errorf("response contains no supported rules")
+	}
+
+	body, cacheErr := m.readRuleCache(url)
+	if cacheErr != nil {
+		logx.Warnf("GeoData", "Failed to refresh %s: %v; cached rules unavailable: %v", url, refreshErr, cacheErr)
+		return false
+	}
+	if !parseRuleSource(body, state) {
+		logx.Warnf("GeoData", "Failed to refresh %s: %v; cached rules are invalid", url, refreshErr)
+		return false
+	}
+	logx.Warnf("GeoData", "Failed to refresh %s: %v; using cached rules", url, refreshErr)
+	return true
+}
+
+func downloadRuleSource(url string) ([]byte, error) {
 	client := newRuleDownloadClient()
 	if client == nil {
 		client = &http.Client{Timeout: 30 * time.Second}
 	}
 	resp, err := client.Get(url)
 	if err != nil {
-		logx.Warnf("GeoData", "Failed to download %s: %v", url, err)
-		return false
+		return nil, err
 	}
 	defer resp.Body.Close()
 
-	// Read the full response body.
-	body, err := io.ReadAll(resp.Body)
-	if err != nil {
-		logx.Warnf("GeoData", "Failed to read body from %s: %v", url, err)
-		return false
+	if resp.StatusCode < http.StatusOK || resp.StatusCode >= http.StatusMultipleChoices {
+		return nil, fmt.Errorf("unexpected HTTP status %s", resp.Status)
 	}
 
-	// 1. Try parsing as YAML.
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return nil, err
+	}
+	if len(bytes.TrimSpace(body)) == 0 {
+		return nil, fmt.Errorf("empty response")
+	}
+	return body, nil
+}
+
+func parseRuleSource(body []byte, state *ruleBuildState) bool {
+	parsed := false
 	var rs RuleSet
 	if err := yaml.Unmarshal(body, &rs); err == nil && len(rs.Payload) > 0 {
 		for _, rule := range rs.Payload {
-			parseRule(rule, state)
+			if parseRule(rule, state) {
+				parsed = true
+			}
 		}
-		return true
+		return parsed
 	}
 
-	// 2. Fallback: if YAML parsing failed (e.g. plain-text list), parse line by line.
-	// This supports plain-text .list files, while the above path handles unified YAML payloads.
 	scanner := bytes.NewBuffer(body)
 	for {
 		line, err := scanner.ReadString('\n')
 		if err != nil && err != io.EOF {
 			break
 		}
-		parseRule(line, state)
+		if parseRule(line, state) {
+			parsed = true
+		}
 		if err == io.EOF {
 			break
 		}
 	}
-	return true
+	return parsed
+}
+
+func (m *Manager) ruleCachePath(url string) (string, error) {
+	if m == nil || strings.TrimSpace(m.cacheDir) == "" {
+		return "", fmt.Errorf("rule cache directory is unavailable")
+	}
+	sum := sha256.Sum256([]byte(url))
+	return filepath.Join(m.cacheDir, fmt.Sprintf("%x.rules", sum)), nil
+}
+
+func (m *Manager) readRuleCache(url string) ([]byte, error) {
+	path, err := m.ruleCachePath(url)
+	if err != nil {
+		return nil, err
+	}
+
+	ruleCacheFileMu.Lock()
+	defer ruleCacheFileMu.Unlock()
+	return os.ReadFile(path)
+}
+
+func (m *Manager) writeRuleCache(url string, body []byte) error {
+	path, err := m.ruleCachePath(url)
+	if err != nil {
+		return err
+	}
+
+	ruleCacheFileMu.Lock()
+	defer ruleCacheFileMu.Unlock()
+
+	if err := os.MkdirAll(m.cacheDir, 0o700); err != nil {
+		return err
+	}
+	tmp, err := os.CreateTemp(m.cacheDir, ".rules-*")
+	if err != nil {
+		return err
+	}
+	tmpPath := tmp.Name()
+	defer os.Remove(tmpPath)
+	defer tmp.Close()
+
+	if err := tmp.Chmod(0o600); err != nil {
+		return err
+	}
+	if _, err := tmp.Write(body); err != nil {
+		return err
+	}
+	if err := tmp.Sync(); err != nil {
+		return err
+	}
+	if err := tmp.Close(); err != nil {
+		return err
+	}
+	return os.Rename(tmpPath, path)
 }
 
 // parseRule processes a single rule line.
-func parseRule(line string, state *ruleBuildState) {
+func parseRule(line string, state *ruleBuildState) bool {
 	line = strings.TrimSpace(line)
 	if line == "" || strings.HasPrefix(line, "#") || strings.HasPrefix(line, "//") {
-		return
+		return false
 	}
 
 	// 1. Try parsing Clash format: TYPE,VALUE,...
@@ -251,26 +366,29 @@ func parseRule(line string, state *ruleBuildState) {
 		case "DOMAIN":
 			if v := normalizeRuleDomain(ruleValue); v != "" {
 				state.exact[v] = struct{}{}
+				return true
 			}
 		case "DOMAIN-KEYWORD":
 			if v := normalizeRuleKeyword(ruleValue); v != "" {
 				state.keyword[v] = struct{}{}
+				return true
 			}
 		case "DOMAIN-SUFFIX":
 			if v := normalizeRuleDomain(ruleValue); v != "" {
 				state.suffix[v] = struct{}{}
+				return true
 			}
 		case "IP-CIDR", "IP-CIDR6":
-			parseIPLine(ruleValue, state)
+			return parseIPLine(ruleValue, state)
 		}
-		return
+		return false
 	}
 
 	// 2. Try parsing as plain CIDR or IP.
 	if parseIPLine(line, state) {
-		return
+		return true
 	}
-	parseBareDomainLine(line, state)
+	return parseBareDomainLine(line, state)
 }
 
 func parseIPLine(line string, state *ruleBuildState) bool {

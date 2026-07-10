@@ -37,6 +37,7 @@ import (
 
 func newRuleManagerForTest(t *testing.T, payload string) *geodata.Manager {
 	t.Helper()
+	t.Setenv("SUDOKU_RULE_CACHE_DIR", t.TempDir())
 
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "text/yaml")
