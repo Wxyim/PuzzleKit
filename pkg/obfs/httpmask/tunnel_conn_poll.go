@@ -169,18 +169,19 @@ func (c *pollConn) pullLoop() {
 
 		scanner := bufio.NewScanner(resp.Body)
 		for scanner.Scan() {
-			line := scanner.Text()
-			if line == "" {
+			line := scanner.Bytes()
+			if len(line) == 0 {
 				continue
 			}
-			payload, err := base64.StdEncoding.DecodeString(line)
+			payload := make([]byte, base64.StdEncoding.DecodedLen(len(line)))
+			n, err := base64.StdEncoding.Decode(payload, line)
 			if err != nil {
 				_ = resp.Body.Close()
 				_ = c.closeWithError(fmt.Errorf("poll pull decode failed: %w", err))
 				return
 			}
 			select {
-			case c.rxc <- payload:
+			case c.rxc <- payload[:n]:
 			case <-c.closed:
 				_ = resp.Body.Close()
 				return
@@ -264,10 +265,11 @@ func (c *pollConn) pushLoop() {
 				}
 			}
 
-			tmp := make([]byte, encLen)
+			buf.Grow(encLen + 1)
+			tmp := buf.AvailableBuffer()[:encLen]
 			base64.StdEncoding.Encode(tmp, chunk)
-			buf.Write(tmp)
-			buf.WriteByte('\n')
+			tmp = append(tmp, '\n')
+			_, _ = buf.Write(tmp)
 			pendingRaw += len(chunk)
 		}
 		return nil

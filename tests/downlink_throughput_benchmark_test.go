@@ -39,6 +39,7 @@ func BenchmarkDownlinkThroughputConcurrentMatrix(b *testing.B) {
 	}{
 		{"httpmask_off", "legacy"},
 		{"httpmask_stream", "stream"},
+		{"httpmask_poll", "poll"},
 		{"httpmask_ws", "ws"},
 	}
 	muxModes := []string{"off", "auto", "on"}

@@ -63,6 +63,34 @@ func BenchmarkPureWriteThroughput_DefaultPadding(b *testing.B) {
 	benchmarkPureWriteThroughput(b, 5, 15)
 }
 
+func BenchmarkPureWriteThroughput_FullPadding(b *testing.B) {
+	benchmarkPureWriteThroughput(b, 100, 100)
+}
+
+func benchmarkPackedWriteThroughput(b *testing.B, pMin, pMax int) {
+	table := NewTable("packed-throughput-key", "prefer_ascii")
+	conn := NewPackedConn(discardConn{}, table, pMin, pMax)
+	data := make([]byte, 32*1024)
+	_, _ = rand.Read(data)
+
+	b.SetBytes(int64(len(data)))
+	b.ReportAllocs()
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		if _, err := conn.Write(data); err != nil {
+			b.Fatal(err)
+		}
+	}
+}
+
+func BenchmarkPackedWriteThroughput_NoPadding(b *testing.B) {
+	benchmarkPackedWriteThroughput(b, 0, 0)
+}
+
+func BenchmarkPackedWriteThroughput_DefaultPadding(b *testing.B) {
+	benchmarkPackedWriteThroughput(b, 5, 15)
+}
+
 func benchmarkPureReadThroughput(b *testing.B, pMin, pMax int) {
 	table := NewTable("pure-throughput-key", "prefer_ascii")
 	data := make([]byte, 32*1024)
@@ -93,6 +121,57 @@ func BenchmarkPureReadThroughput_NoPadding(b *testing.B) {
 
 func BenchmarkPureReadThroughput_DefaultPadding(b *testing.B) {
 	benchmarkPureReadThroughput(b, 5, 15)
+}
+
+func benchmarkPackedReadThroughput(b *testing.B, pMin, pMax int) {
+	table := NewTable("packed-throughput-key", "prefer_ascii")
+	data := make([]byte, 32*1024)
+	_, _ = rand.Read(data)
+
+	var encoded bytes.Buffer
+	writer := NewPackedConn(writeOnlyConn{Writer: &encoded}, table, pMin, pMax)
+	if _, err := writer.Write(data); err != nil {
+		b.Fatal(err)
+	}
+	encodedData := append([]byte(nil), encoded.Bytes()...)
+	out := make([]byte, len(data))
+	reader := NewPackedConn(&cyclicReadConn{data: encodedData}, table, pMin, pMax)
+
+	b.SetBytes(int64(len(data)))
+	b.ReportAllocs()
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		if _, err := io.ReadFull(reader, out); err != nil {
+			b.Fatal(err)
+		}
+	}
+}
+
+func BenchmarkPackedReadThroughput_NoPadding(b *testing.B) {
+	benchmarkPackedReadThroughput(b, 0, 0)
+}
+
+func BenchmarkPackedReadThroughput_DefaultPadding(b *testing.B) {
+	benchmarkPackedReadThroughput(b, 5, 15)
+}
+
+var benchmarkConnSink net.Conn
+
+func BenchmarkCodecConnConstruction(b *testing.B) {
+	table := NewTable("codec-construction-key", "prefer_ascii")
+
+	b.Run("pure", func(b *testing.B) {
+		b.ReportAllocs()
+		for i := 0; i < b.N; i++ {
+			benchmarkConnSink = NewConn(discardConn{}, table, 5, 15, false)
+		}
+	})
+	b.Run("packed", func(b *testing.B) {
+		b.ReportAllocs()
+		for i := 0; i < b.N; i++ {
+			benchmarkConnSink = NewPackedConn(discardConn{}, table, 5, 15)
+		}
+	})
 }
 
 type writeOnlyConn struct {
