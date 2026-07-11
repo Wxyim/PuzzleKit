@@ -38,6 +38,8 @@ type queuedConn struct {
 	// writeClosed is closed by CloseWrite to stop accepting new payloads.
 	// When closed, Write returns io.ErrClosedPipe, but Read is unaffected.
 	writeClosed chan struct{}
+	readEOF     chan struct{}
+	readEOFOnce sync.Once
 
 	mu         sync.Mutex
 	readBuf    []byte
@@ -58,6 +60,13 @@ func (c *queuedConn) CloseWrite() error {
 	}
 	c.mu.Unlock()
 	return nil
+}
+
+func (c *queuedConn) markReadEOF() {
+	if c == nil || c.readEOF == nil {
+		return
+	}
+	c.readEOFOnce.Do(func() { close(c.readEOF) })
 }
 
 func (c *queuedConn) closeWithError(err error) error {
@@ -93,6 +102,18 @@ func (c *queuedConn) Read(b []byte) (n int, err error) {
 	if len(c.readBuf) == 0 {
 		select {
 		case c.readBuf = <-c.rxc:
+		default:
+		}
+	}
+	if len(c.readBuf) == 0 {
+		select {
+		case c.readBuf = <-c.rxc:
+		case <-c.readEOF:
+			select {
+			case c.readBuf = <-c.rxc:
+			default:
+				return 0, io.EOF
+			}
 		case <-c.closed:
 			return 0, c.closedErr()
 		}

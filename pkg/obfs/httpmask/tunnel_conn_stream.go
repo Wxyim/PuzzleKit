@@ -54,7 +54,11 @@ type streamSplitConn struct {
 }
 
 func (c *streamSplitConn) Close() error {
-	_ = c.closeWithError(io.ErrClosedPipe)
+	return c.closeWithError(io.ErrClosedPipe)
+}
+
+func (c *streamSplitConn) closeWithError(err error) error {
+	_ = c.queuedConn.closeWithError(err)
 
 	if c.cancel != nil {
 		c.cancel()
@@ -87,6 +91,7 @@ func dialStreamSplit(ctx context.Context, serverAddress string, opts TunnelDialO
 			closed:      make(chan struct{}),
 			writeCh:     make(chan []byte, queuedConnPayloadQueueDepth),
 			writeClosed: make(chan struct{}),
+			readEOF:     make(chan struct{}),
 			localAddr:   &net.TCPAddr{},
 			remoteAddr:  &net.TCPAddr{},
 		},
@@ -172,7 +177,7 @@ func (c *streamSplitConn) pullLoop() {
 		resp, err := c.client.Do(req)
 		if err != nil {
 			cancel()
-			if isDialError(err) && dialRetry < maxDialRetry {
+			if (isDialError(err) || isRetryableHTTPTransportError(err)) && dialRetry < maxDialRetry {
 				dialRetry++
 				select {
 				case <-time.After(backoff):
@@ -218,6 +223,10 @@ func (c *streamSplitConn) pullLoop() {
 				_ = resp.Body.Close()
 				cancel()
 				if errors.Is(rerr, io.EOF) {
+					if resp.Trailer.Get(tunnelStreamEOFHeader) == "1" {
+						c.markReadEOF()
+						return
+					}
 					// Long-poll ended; retry.
 					break
 				}
@@ -338,8 +347,14 @@ func (c *streamSplitConn) pushLoop() {
 					}
 					_, _ = buf.Write(b)
 				default:
-					_ = flushWithRetry()
-					bestEffortCloseSession(c.client, c.finURL, c.headerHost, TunnelModeStream, c.auth)
+					if err := flushWithRetry(); err != nil {
+						_ = c.closeWithError(fmt.Errorf("stream push flush failed: %w", err))
+						return
+					}
+					if err := sendSessionControl(c.client, c.finURL, c.headerHost, TunnelModeStream, c.auth); err != nil {
+						_ = c.closeWithError(fmt.Errorf("stream FIN failed: %w", err))
+						return
+					}
 					return
 				}
 			}

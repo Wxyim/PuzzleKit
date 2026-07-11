@@ -85,6 +85,7 @@ func dialPoll(ctx context.Context, serverAddress string, opts TunnelDialOptions)
 			closed:      make(chan struct{}),
 			writeCh:     make(chan []byte, queuedConnPayloadQueueDepth),
 			writeClosed: make(chan struct{}),
+			readEOF:     make(chan struct{}),
 			localAddr:   &net.TCPAddr{},
 			remoteAddr:  &net.TCPAddr{},
 		},
@@ -162,7 +163,7 @@ func (c *pollConn) pullLoop() {
 
 		resp, err := c.client.Do(req)
 		if err != nil {
-			if isDialError(err) && dialRetry < maxDialRetry {
+			if (isDialError(err) || isRetryableHTTPTransportError(err)) && dialRetry < maxDialRetry {
 				dialRetry++
 				select {
 				case <-time.After(backoff):
@@ -211,6 +212,10 @@ func (c *pollConn) pullLoop() {
 		_ = resp.Body.Close()
 		if err := scanner.Err(); err != nil {
 			_ = c.closeWithError(fmt.Errorf("poll pull scan failed: %w", err))
+			return
+		}
+		if resp.Trailer.Get(tunnelStreamEOFHeader) == "1" {
+			c.markReadEOF()
 			return
 		}
 	}
@@ -339,8 +344,14 @@ func (c *pollConn) pushLoop() {
 						return
 					}
 				default:
-					_ = flushWithRetry()
-					bestEffortCloseSession(c.client, c.finURL, c.headerHost, TunnelModePoll, c.auth)
+					if err := flushWithRetry(); err != nil {
+						_ = c.closeWithError(fmt.Errorf("poll push flush failed: %w", err))
+						return
+					}
+					if err := sendSessionControl(c.client, c.finURL, c.headerHost, TunnelModePoll, c.auth); err != nil {
+						_ = c.closeWithError(fmt.Errorf("poll FIN failed: %w", err))
+						return
+					}
 					return
 				}
 			}
