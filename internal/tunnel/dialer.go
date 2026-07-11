@@ -57,7 +57,11 @@ func (d *BaseDialer) DialReverseBase() (net.Conn, error) {
 }
 
 func (d *BaseDialer) dialBase() (net.Conn, error) {
-	return d.dialBaseWithUplinkMode(ObfsUplinkPure)
+	return d.dialBaseContext(context.Background())
+}
+
+func (d *BaseDialer) dialBaseContext(ctx context.Context) (net.Conn, error) {
+	return d.dialBaseWithUplinkModeContext(ctx, ObfsUplinkPure)
 }
 
 func (d *BaseDialer) dialHTTPMaskTunnel(dialCtx context.Context, table *sudoku.Table, tableHint uint32, hasTableHint bool, uplinkMode ObfsUplinkMode, upgrade func(net.Conn) (net.Conn, error)) (net.Conn, error) {
@@ -107,15 +111,22 @@ func (d *BaseDialer) pickTable() (*sudoku.Table, uint32, bool, error) {
 }
 
 func (d *BaseDialer) dialBaseWithUplinkMode(uplinkMode ObfsUplinkMode) (net.Conn, error) {
+	return d.dialBaseWithUplinkModeContext(context.Background(), uplinkMode)
+}
+
+func (d *BaseDialer) dialBaseWithUplinkModeContext(ctx context.Context, uplinkMode ObfsUplinkMode) (net.Conn, error) {
 	if d.Config == nil {
 		return nil, fmt.Errorf("missing config")
+	}
+	if ctx == nil {
+		ctx = context.Background()
 	}
 
 	var baseConn net.Conn
 
 	// HTTP tunnel (CDN-friendly) modes. The returned conn already strips HTTP headers.
 	if d.Config.HTTPMaskTunnelEnabled() {
-		dialCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		dialCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
 		defer cancel()
 		table, tableHint, hasTableHint, err := d.pickTable()
 		if err != nil {
@@ -130,7 +141,7 @@ func (d *BaseDialer) dialBaseWithUplinkMode(uplinkMode ObfsUplinkMode) (net.Conn
 		baseConn = conn
 	} else {
 		// Resolve server address with DNS concurrency and optimistic cache.
-		resolveCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		resolveCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
 		defer cancel()
 
 		serverAddr, err := dnsutil.ResolveWithCache(resolveCtx, d.Config.ServerAddress)
@@ -139,10 +150,16 @@ func (d *BaseDialer) dialBaseWithUplinkMode(uplinkMode ObfsUplinkMode) (net.Conn
 		}
 
 		// 1. Establish base TCP connection
-		rawRemote, err := dnsutil.OutboundDialer(5*time.Second).Dial("tcp", serverAddr)
+		connectCtx, connectCancel := context.WithTimeout(ctx, 5*time.Second)
+		rawRemote, err := dnsutil.OutboundDialer(0).DialContext(connectCtx, "tcp", serverAddr)
+		connectCancel()
 		if err != nil {
 			return nil, fmt.Errorf("dial server failed: %w", err)
 		}
+		stopContextClose := context.AfterFunc(ctx, func() {
+			_ = rawRemote.Close()
+		})
+		defer stopContextClose()
 
 		// 2. Send HTTP mask
 		if !d.Config.HTTPMask.Disable {
@@ -160,7 +177,15 @@ func (d *BaseDialer) dialBaseWithUplinkMode(uplinkMode ObfsUplinkMode) (net.Conn
 		}
 		baseConn, err = ClientHandshakeWithUplinkMode(rawRemote, d.Config, table, d.PrivateKey, uplinkMode, tableHint, hasTableHint)
 		if err != nil {
+			_ = rawRemote.Close()
 			return nil, err
+		}
+		if !stopContextClose() {
+			_ = baseConn.Close()
+			if err := ctx.Err(); err != nil {
+				return nil, err
+			}
+			return nil, net.ErrClosed
 		}
 	}
 

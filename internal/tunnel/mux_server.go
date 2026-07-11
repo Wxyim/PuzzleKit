@@ -76,6 +76,7 @@ func HandleMuxWithDialer(conn net.Conn, onConnect func(targetAddr string), dialT
 
 		connutil.PipeConn(stream, target)
 	})
+	sess.startKeepalive(muxKeepaliveInterval)
 
 	<-sess.closed
 	err := sess.closedErr()

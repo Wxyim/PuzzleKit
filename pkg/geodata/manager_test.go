@@ -25,7 +25,9 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"net/url"
+	"os"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 )
@@ -222,6 +224,128 @@ func TestDownloadAndParse_YAMLBareDomains(t *testing.T) {
 	}
 }
 
+func TestDownloadAndParse_FallsBackToLastGoodCache(t *testing.T) {
+	var unavailable atomic.Bool
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if unavailable.Load() {
+			http.Error(w, "temporarily unavailable", http.StatusServiceUnavailable)
+			return
+		}
+		_, _ = w.Write([]byte("payload:\n  - DOMAIN-SUFFIX,cached.example\n"))
+	}))
+	t.Cleanup(srv.Close)
+
+	cacheDir := t.TempDir()
+	m := NewManager([]string{srv.URL})
+	m.cacheDir = cacheDir
+
+	state := newRuleBuildState()
+	if !m.downloadAndParse(srv.URL, state) {
+		t.Fatal("expected initial rule download to succeed")
+	}
+	if _, ok := state.suffix["cached.example"]; !ok {
+		t.Fatal("expected initial rules to be parsed")
+	}
+
+	unavailable.Store(true)
+	restarted := NewManager([]string{srv.URL})
+	restarted.cacheDir = cacheDir
+	cachedState := newRuleBuildState()
+	if !restarted.downloadAndParse(srv.URL, cachedState) {
+		t.Fatal("expected failed refresh to use cached rules")
+	}
+	if _, ok := cachedState.suffix["cached.example"]; !ok {
+		t.Fatal("expected cached rules after failed refresh")
+	}
+}
+
+func TestDownloadAndParse_CacheIsIsolatedByURL(t *testing.T) {
+	var unavailable atomic.Bool
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if unavailable.Load() {
+			http.Error(w, "temporarily unavailable", http.StatusServiceUnavailable)
+			return
+		}
+		_, _ = w.Write([]byte("payload:\n  - DOMAIN-SUFFIX,first.example\n"))
+	}))
+	t.Cleanup(srv.Close)
+
+	m := NewManager(nil)
+	m.cacheDir = t.TempDir()
+	if !m.downloadAndParse(srv.URL+"/first", newRuleBuildState()) {
+		t.Fatal("expected first URL to populate its cache")
+	}
+
+	unavailable.Store(true)
+	if m.downloadAndParse(srv.URL+"/second", newRuleBuildState()) {
+		t.Fatal("different URL must not reuse another source's cache")
+	}
+}
+
+func TestDownloadAndParse_RefreshReplacesCachedRules(t *testing.T) {
+	var payload atomic.Value
+	payload.Store("payload:\n  - DOMAIN-SUFFIX,old.example\n")
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = w.Write([]byte(payload.Load().(string)))
+	}))
+
+	cacheDir := t.TempDir()
+	m := NewManager([]string{srv.URL})
+	m.cacheDir = cacheDir
+	if !m.downloadAndParse(srv.URL, newRuleBuildState()) {
+		t.Fatal("expected initial rule download to succeed")
+	}
+
+	payload.Store("payload:\n  - DOMAIN-SUFFIX,new.example\n")
+	if !m.downloadAndParse(srv.URL, newRuleBuildState()) {
+		t.Fatal("expected refreshed rule download to succeed")
+	}
+
+	payload.Store("<html>not rules</html>")
+	fallbackState := newRuleBuildState()
+	if !m.downloadAndParse(srv.URL, fallbackState) {
+		t.Fatal("expected invalid refresh content to use cached rules")
+	}
+	if _, ok := fallbackState.suffix["new.example"]; !ok {
+		t.Fatal("invalid refresh content must not replace the last good cache")
+	}
+	srv.Close()
+
+	restarted := NewManager([]string{srv.URL})
+	restarted.cacheDir = cacheDir
+	state := newRuleBuildState()
+	if !restarted.downloadAndParse(srv.URL, state) {
+		t.Fatal("expected cached refreshed rules after server shutdown")
+	}
+	if _, ok := state.suffix["new.example"]; !ok {
+		t.Fatal("expected the latest successful response in cache")
+	}
+	if _, ok := state.suffix["old.example"]; ok {
+		t.Fatal("stale rules must not remain after cache refresh")
+	}
+}
+
+func TestDownloadAndParse_RejectsInvalidCache(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		http.Error(w, "temporarily unavailable", http.StatusServiceUnavailable)
+	}))
+	t.Cleanup(srv.Close)
+
+	m := NewManager([]string{srv.URL})
+	m.cacheDir = t.TempDir()
+	path, err := m.ruleCachePath(srv.URL)
+	if err != nil {
+		t.Fatalf("build cache path: %v", err)
+	}
+	if err := os.WriteFile(path, []byte("<html>not rules</html>"), 0o600); err != nil {
+		t.Fatalf("write invalid cache: %v", err)
+	}
+
+	if m.downloadAndParse(srv.URL, newRuleBuildState()) {
+		t.Fatal("invalid cached content must not be loaded")
+	}
+}
+
 func TestMatchCN_DomainKeywordRuleMatch(t *testing.T) {
 	m := &Manager{
 		domainExact:   make(map[string]struct{}),
@@ -258,6 +382,7 @@ func TestUpdate_AppliesEachSourceIncrementally(t *testing.T) {
 	t.Cleanup(srv.Close)
 
 	m := NewManager([]string{srv.URL + "/first", srv.URL + "/second"})
+	m.cacheDir = t.TempDir()
 
 	done := make(chan struct{})
 	go func() {

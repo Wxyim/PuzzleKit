@@ -917,8 +917,7 @@ func (s *TunnelServer) pollPush(rawConn net.Conn, token string, body io.Reader) 
 		return HandleDone, nil, nil
 	}
 
-	lines := bytes.Split(payload, []byte{'\n'})
-	for _, line := range lines {
+	for line := range bytes.SplitSeq(payload, []byte{'\n'}) {
 		line = bytes.TrimSpace(line)
 		if len(line) == 0 {
 			continue

@@ -113,6 +113,8 @@ func RunClientPool(configs []*config.Config, tableSets [][]*sudoku.Table) {
 	if err != nil {
 		logx.Fatalf("Init", "Failed to build outbound dialer: %v", err)
 	}
+	stopMuxWarmers := startMuxWarmers(runtimes)
+	defer stopMuxWarmers()
 
 	startReverseClient(primary.Config, &primary.BaseDialer)
 

@@ -1,15 +1,11 @@
 package tests
 
 import (
-	"bufio"
 	"bytes"
 	"fmt"
 	"io"
-	"math"
 	"net"
-	"net/http"
 	"os"
-	"slices"
 	"strconv"
 	"strings"
 	"sync"
@@ -43,6 +39,7 @@ func BenchmarkDownlinkThroughputConcurrentMatrix(b *testing.B) {
 	}{
 		{"httpmask_off", "legacy"},
 		{"httpmask_stream", "stream"},
+		{"httpmask_poll", "poll"},
 		{"httpmask_ws", "ws"},
 	}
 	muxModes := []string{"off", "auto", "on"}
@@ -56,32 +53,6 @@ func BenchmarkDownlinkThroughputConcurrentMatrix(b *testing.B) {
 				})
 			}
 		}
-	}
-}
-
-func BenchmarkHTTPMaskRTTMatrix(b *testing.B) {
-	samples := envInt(b, "SUDOKU_RTT_BENCH_SAMPLES", 7)
-	if samples < 1 {
-		samples = 1
-	}
-	oneWay := time.Duration(envInt(b, "SUDOKU_RTT_ONE_WAY_MS", 100)) * time.Millisecond
-	appDelay := time.Duration(envInt(b, "SUDOKU_RTT_APP_DELAY_MS", 20)) * time.Millisecond
-
-	cases := []struct {
-		name string
-		mode string
-		mux  string
-	}{
-		{"httpmask_disable/mux_off", "legacy", "off"},
-		{"httpmask_stream/mux_off", "stream", "off"},
-		{"httpmask_stream/mux_on", "stream", "on"},
-		{"httpmask_ws/mux_off", "ws", "off"},
-		{"httpmask_ws/mux_on", "ws", "on"},
-	}
-	for _, tc := range cases {
-		b.Run(tc.name, func(b *testing.B) {
-			benchmarkConnectEchoRTT(b, tc.mode, tc.mux, oneWay, appDelay, samples)
-		})
 	}
 }
 
@@ -120,55 +91,11 @@ func benchmarkDownlinkThroughputConcurrent(b *testing.B, connCount int, bytesPer
 	}
 }
 
-func benchmarkConnectEchoRTT(b *testing.B, httpmaskMode, muxMode string, oneWay, appDelay time.Duration, samples int) {
-	b.Helper()
-
-	bench := newDownlinkBenchHarness(b, true, httpmaskMode, muxMode, nil, oneWay)
-	echoAddr, closeEcho := startBenchmarkEchoServer(b)
-	defer closeEcho()
-	proxyAddr, closeProxy := startBenchmarkConnectProxy(b, bench.dialer)
-	defer closeProxy()
-
-	warmups := 2
-	for i := 0; i < warmups; i++ {
-		if _, _, _, err := measureBenchmarkConnectEcho(proxyAddr, echoAddr, appDelay); err != nil {
-			b.Fatalf("warmup: %v", err)
-		}
-	}
-
-	setupSamples := make([]time.Duration, 0, samples)
-	totalSamples := make([]time.Duration, 0, samples)
-	establishedSamples := make([]time.Duration, 0, samples)
-	b.ReportAllocs()
-	b.ResetTimer()
-	for i := 0; i < b.N; i++ {
-		setupSamples = setupSamples[:0]
-		totalSamples = totalSamples[:0]
-		establishedSamples = establishedSamples[:0]
-		for j := 0; j < samples; j++ {
-			setup, total, established, err := measureBenchmarkConnectEcho(proxyAddr, echoAddr, appDelay)
-			if err != nil {
-				b.Fatalf("sample: %v", err)
-			}
-			setupSamples = append(setupSamples, setup)
-			totalSamples = append(totalSamples, total)
-			establishedSamples = append(establishedSamples, established)
-		}
-	}
-	b.StopTimer()
-	b.ReportMetric(durationMS(percentileDuration(setupSamples, 50)), "setup_p50_ms")
-	b.ReportMetric(durationMS(percentileDuration(setupSamples, 95)), "setup_p95_ms")
-	b.ReportMetric(durationMS(percentileDuration(totalSamples, 50)), "total_echo_p50_ms")
-	b.ReportMetric(durationMS(percentileDuration(totalSamples, 95)), "total_echo_p95_ms")
-	b.ReportMetric(durationMS(percentileDuration(establishedSamples, 50)), "est_echo_p50_ms")
-	b.ReportMetric(durationMS(percentileDuration(establishedSamples, 95)), "est_echo_p95_ms")
-}
-
 type downlinkBenchHarness struct {
 	dialer tunnel.Dialer
 }
 
-func newDownlinkBenchHarness(tb testing.TB, pureDownlink bool, httpmaskMode, muxMode string, dialTarget func(string) (net.Conn, error), oneWayDelay ...time.Duration) *downlinkBenchHarness {
+func newDownlinkBenchHarness(tb testing.TB, pureDownlink bool, httpmaskMode, muxMode string, dialTarget func(string) (net.Conn, error)) *downlinkBenchHarness {
 	tb.Helper()
 	if dialTarget == nil {
 		dialTarget = dialBenchmarkTarget
@@ -204,14 +131,7 @@ func newDownlinkBenchHarness(tb testing.TB, pureDownlink bool, httpmaskMode, mux
 	}
 	go serveBenchmarkTunnel(ln, cfg, []*sudoku.Table{table}, tunnelSrv, dialTarget)
 
-	serverAddr := ln.Addr().String()
-	if len(oneWayDelay) > 0 && oneWayDelay[0] > 0 {
-		proxyAddr, closeProxy := startBenchmarkDelayProxy(tb, serverAddr, oneWayDelay[0])
-		tb.Cleanup(closeProxy)
-		serverAddr = proxyAddr
-	}
-
-	clientCfg := newBenchmarkConfig("client", pureDownlink, httpmaskMode, muxMode, serverAddr)
+	clientCfg := newBenchmarkConfig("client", pureDownlink, httpmaskMode, muxMode, ln.Addr().String())
 	base := tunnel.BaseDialer{Config: clientCfg, Tables: []*sudoku.Table{table}}
 	if clientCfg.SessionMuxEnabled() {
 		return &downlinkBenchHarness{dialer: &tunnel.MuxDialer{BaseDialer: base}}
@@ -562,229 +482,6 @@ func finishBenchmarkSourceConn(conn net.Conn) {
 	_ = conn.SetReadDeadline(time.Now().Add(5 * time.Second))
 	_, _ = io.Copy(io.Discard, conn)
 	_ = conn.SetReadDeadline(time.Time{})
-}
-
-func startBenchmarkEchoServer(tb testing.TB) (addr string, stop func()) {
-	tb.Helper()
-	ln, err := net.Listen("tcp", "127.0.0.1:0")
-	if err != nil {
-		tb.Fatalf("listen echo: %v", err)
-	}
-	done := make(chan struct{})
-	go func() {
-		defer close(done)
-		for {
-			conn, err := ln.Accept()
-			if err != nil {
-				return
-			}
-			go func(c net.Conn) {
-				defer c.Close()
-				_, _ = io.Copy(c, c)
-			}(conn)
-		}
-	}()
-	return ln.Addr().String(), func() {
-		_ = ln.Close()
-		<-done
-	}
-}
-
-func startBenchmarkConnectProxy(tb testing.TB, dialer tunnel.Dialer) (addr string, stop func()) {
-	tb.Helper()
-	ln, err := net.Listen("tcp", "127.0.0.1:0")
-	if err != nil {
-		tb.Fatalf("listen connect proxy: %v", err)
-	}
-	done := make(chan struct{})
-	go func() {
-		defer close(done)
-		for {
-			conn, err := ln.Accept()
-			if err != nil {
-				return
-			}
-			go handleBenchmarkConnectProxyConn(conn, dialer)
-		}
-	}()
-	return ln.Addr().String(), func() {
-		_ = ln.Close()
-		<-done
-	}
-}
-
-func handleBenchmarkConnectProxyConn(client net.Conn, dialer tunnel.Dialer) {
-	defer client.Close()
-	req, err := http.ReadRequest(bufio.NewReader(client))
-	if err != nil {
-		return
-	}
-	if req.Method != http.MethodConnect {
-		_, _ = client.Write([]byte("HTTP/1.1 405 Method Not Allowed\r\n\r\n"))
-		return
-	}
-	targetAddr := ensureBenchmarkHostPort(req.Host)
-	target, err := dialer.Dial(targetAddr)
-	if err != nil {
-		_, _ = client.Write([]byte("HTTP/1.1 502 Bad Gateway\r\n\r\n"))
-		return
-	}
-	_, _ = client.Write([]byte("HTTP/1.1 200 Connection Established\r\n\r\n"))
-	connutil.PipeConn(client, target)
-}
-
-func ensureBenchmarkHostPort(host string) string {
-	host = strings.TrimSpace(host)
-	if host == "" {
-		return host
-	}
-	if _, _, err := net.SplitHostPort(host); err == nil {
-		return host
-	}
-	return net.JoinHostPort(host, "443")
-}
-
-func measureBenchmarkConnectEcho(proxyAddr, targetAddr string, appDelay time.Duration) (setup, total, established time.Duration, err error) {
-	start := time.Now()
-	conn, err := net.DialTimeout("tcp", proxyAddr, 5*time.Second)
-	if err != nil {
-		return 0, 0, 0, err
-	}
-	defer conn.Close()
-
-	_ = conn.SetDeadline(time.Now().Add(12 * time.Second))
-	req := fmt.Sprintf("CONNECT %s HTTP/1.1\r\nHost: %s\r\n\r\n", targetAddr, targetAddr)
-	if _, err := io.WriteString(conn, req); err != nil {
-		return 0, 0, 0, err
-	}
-	br := bufio.NewReader(conn)
-	resp, err := http.ReadResponse(br, &http.Request{Method: http.MethodConnect})
-	if err != nil {
-		return 0, 0, 0, err
-	}
-	if resp.Body != nil {
-		_ = resp.Body.Close()
-	}
-	if resp.StatusCode != http.StatusOK {
-		return 0, 0, 0, fmt.Errorf("CONNECT status %s", resp.Status)
-	}
-	setup = time.Since(start)
-
-	if appDelay > 0 {
-		time.Sleep(appDelay)
-	}
-	echoStart := time.Now()
-	if _, err := conn.Write([]byte{0x42}); err != nil {
-		return 0, 0, 0, err
-	}
-	b, err := br.ReadByte()
-	if err != nil {
-		return 0, 0, 0, err
-	}
-	if b != 0x42 {
-		return 0, 0, 0, fmt.Errorf("bad echo byte %x", b)
-	}
-	established = time.Since(echoStart)
-	total = time.Since(start)
-	return setup, total, established, nil
-}
-
-type benchmarkDelayedChunk struct {
-	due  time.Time
-	data []byte
-}
-
-func startBenchmarkDelayProxy(tb testing.TB, backend string, oneWay time.Duration) (addr string, stop func()) {
-	tb.Helper()
-	ln, err := net.Listen("tcp", "127.0.0.1:0")
-	if err != nil {
-		tb.Fatalf("listen delay proxy: %v", err)
-	}
-	done := make(chan struct{})
-	go func() {
-		defer close(done)
-		for {
-			in, err := ln.Accept()
-			if err != nil {
-				return
-			}
-			go func() {
-				out, err := net.DialTimeout("tcp", backend, 5*time.Second)
-				if err != nil {
-					_ = in.Close()
-					return
-				}
-				go copyWithBenchmarkDelay(out, in, oneWay)
-				go copyWithBenchmarkDelay(in, out, oneWay)
-			}()
-		}
-	}()
-	return ln.Addr().String(), func() {
-		_ = ln.Close()
-		<-done
-	}
-}
-
-func copyWithBenchmarkDelay(dst net.Conn, src net.Conn, delay time.Duration) {
-	defer dst.Close()
-	defer src.Close()
-
-	chunks := make(chan benchmarkDelayedChunk, 256)
-	writerDone := make(chan struct{})
-	go func() {
-		defer close(writerDone)
-		for chunk := range chunks {
-			if delay > 0 {
-				if wait := time.Until(chunk.due); wait > 0 {
-					time.Sleep(wait)
-				}
-			}
-			if _, err := dst.Write(chunk.data); err != nil {
-				return
-			}
-		}
-	}()
-
-	buf := make([]byte, 32*1024)
-	for {
-		n, err := src.Read(buf)
-		if n > 0 {
-			data := append([]byte(nil), buf[:n]...)
-			select {
-			case chunks <- benchmarkDelayedChunk{due: time.Now().Add(delay), data: data}:
-			case <-writerDone:
-				return
-			}
-		}
-		if err != nil {
-			close(chunks)
-			<-writerDone
-			return
-		}
-	}
-}
-
-func percentileDuration(samples []time.Duration, percentile float64) time.Duration {
-	if len(samples) == 0 {
-		return 0
-	}
-	ordered := slices.Clone(samples)
-	slices.Sort(ordered)
-	if len(ordered) == 1 {
-		return ordered[0]
-	}
-	rank := percentile / 100 * float64(len(ordered)-1)
-	lo := int(math.Floor(rank))
-	hi := int(math.Ceil(rank))
-	if lo == hi {
-		return ordered[lo]
-	}
-	frac := rank - float64(lo)
-	return time.Duration(float64(ordered[lo])*(1-frac) + float64(ordered[hi])*frac)
-}
-
-func durationMS(d time.Duration) float64 {
-	return float64(d.Microseconds()) / 1000
 }
 
 func envInt(tb testing.TB, name string, fallback int) int {
