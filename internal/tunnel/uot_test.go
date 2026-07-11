@@ -91,3 +91,69 @@ func TestHandleUoTServer_ConnClosed(t *testing.T) {
 		t.Fatalf("timeout")
 	}
 }
+
+func TestHandleUoTServerWithDialer_CustomDialer(t *testing.T) {
+	target, err := net.ListenPacket("udp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("listen packet: %v", err)
+	}
+	defer target.Close()
+
+	payloadCh := make(chan string, 1)
+	go func() {
+		buf := make([]byte, maxUoTPayload)
+		n, addr, err := target.ReadFrom(buf)
+		if err != nil {
+			return
+		}
+		_, _ = target.WriteTo([]byte("pong"), addr)
+		payloadCh <- string(buf[:n])
+	}()
+
+	client, server := net.Pipe()
+	t.Cleanup(func() {
+		_ = client.Close()
+		_ = server.Close()
+	})
+
+	errCh := make(chan error, 1)
+	go func() {
+		errCh <- HandleUoTServerWithDialer(server, func(addr string) (net.Conn, error) {
+			return net.Dial("udp", addr)
+		})
+	}()
+
+	if err := WriteUoTDatagram(client, target.LocalAddr().String(), []byte("ping")); err != nil {
+		t.Fatalf("WriteUoTDatagram error: %v", err)
+	}
+
+	gotAddr, gotPayload, err := ReadUoTDatagram(client)
+	if err != nil {
+		t.Fatalf("ReadUoTDatagram error: %v", err)
+	}
+	if gotAddr != target.LocalAddr().String() {
+		t.Fatalf("addr mismatch: got %q want %q", gotAddr, target.LocalAddr().String())
+	}
+	if string(gotPayload) != "pong" {
+		t.Fatalf("payload mismatch: got %q want %q", gotPayload, "pong")
+	}
+
+	select {
+	case got := <-payloadCh:
+		if got != "ping" {
+			t.Fatalf("target payload mismatch: got %q want %q", got, "ping")
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatalf("timeout waiting for target payload")
+	}
+
+	_ = client.Close()
+	select {
+	case err := <-errCh:
+		if err == nil {
+			t.Fatal("expected shutdown error")
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatalf("timeout")
+	}
+}

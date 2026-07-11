@@ -186,7 +186,7 @@ func EarlyHandshakeUplinkPacked(conn net.Conn) (bool, bool) {
 }
 
 // DialTunnel establishes a bidirectional stream over HTTP:
-//   - stream: packet-up split stream (client-generated session id + upload/pull endpoints)
+//   - stream: split-stream (authorize + upload/pull endpoints; CDN-friendly)
 //   - poll: authorize + push/pull polling tunnel (base64 framed)
 //   - auto: try stream then fall back to poll
 //

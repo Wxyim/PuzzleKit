@@ -110,38 +110,69 @@ func HandleUoTServer(conn net.Conn) error {
 }
 
 // HandleUoTServerWithDialer bridges UDP packets over the already-upgraded tunnel connection
-// using the provided UDP target dialer.
+// using the provided UDP target dialer when one is supplied. When no dialer is provided,
+// it uses a single local UDP socket as the bridge endpoint, matching the upstream behavior.
 func HandleUoTServerWithDialer(conn net.Conn, dial func(addr string) (net.Conn, error)) error {
 	if conn == nil {
 		return fmt.Errorf("nil conn")
 	}
-	if dial == nil {
-		dial = func(addr string) (net.Conn, error) {
-			udpAddr, err := net.ResolveUDPAddr("udp", addr)
-			if err != nil {
-				return nil, err
-			}
-			return net.DialUDP("udp", nil, udpAddr)
-		}
-	}
 
-	var mu sync.Mutex
-	conns := make(map[string]net.Conn)
+	pConn, err := net.ListenPacket("udp", "")
+	if err != nil {
+		return fmt.Errorf("listen udp for uot: %w", err)
+	}
 
 	errCh := make(chan error, 1)
 	var once sync.Once
 
 	closeAll := func(err error) {
 		once.Do(func() {
-			mu.Lock()
-			for _, c := range conns {
-				_ = c.Close()
-			}
-			mu.Unlock()
 			_ = conn.Close()
+			_ = pConn.Close()
 			errCh <- err
 		})
 	}
+
+	if dial == nil {
+		go func() {
+			buf := make([]byte, maxUoTPayload)
+			for {
+				n, addr, err := pConn.ReadFrom(buf)
+				if err != nil {
+					closeAll(err)
+					return
+				}
+				if err := WriteUoTDatagram(conn, addr.String(), buf[:n]); err != nil {
+					closeAll(err)
+					return
+				}
+			}
+		}()
+
+		go func() {
+			for {
+				addrStr, payload, err := ReadUoTDatagram(conn)
+				if err != nil {
+					closeAll(err)
+					return
+				}
+				udpAddr, err := net.ResolveUDPAddr("udp", addrStr)
+				if err != nil {
+					// Skip invalid destinations instead of failing the whole session.
+					continue
+				}
+				if _, err := pConn.WriteTo(payload, udpAddr); err != nil {
+					closeAll(err)
+					return
+				}
+			}
+		}()
+
+		return <-errCh
+	}
+
+	var mu sync.Mutex
+	conns := make(map[string]net.Conn)
 
 	go func() {
 		for {
@@ -169,7 +200,7 @@ func HandleUoTServerWithDialer(conn net.Conn, dial func(addr string) (net.Conn, 
 							mu.Lock()
 							delete(conns, target)
 							mu.Unlock()
-							closeAll(err)
+							_ = c.Close()
 							return
 						}
 						if n == 0 {
@@ -188,8 +219,8 @@ func HandleUoTServerWithDialer(conn net.Conn, dial func(addr string) (net.Conn, 
 
 			if _, err := udpConn.Write(payload); err != nil {
 				mu.Unlock()
-				closeAll(err)
-				return
+				_ = udpConn.Close()
+				continue
 			}
 			mu.Unlock()
 		}
