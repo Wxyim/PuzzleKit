@@ -27,6 +27,8 @@ import (
 	"net/http"
 	"strings"
 	"time"
+
+	"github.com/SUDOKU-ASCII/sudoku/pkg/connutil"
 )
 
 type TunnelMode string
@@ -129,6 +131,20 @@ type earlyHandshakeConn struct {
 	net.Conn
 	userHash     string
 	uplinkPacked bool
+}
+
+func (c *earlyHandshakeConn) CloseWrite() error {
+	if c == nil {
+		return nil
+	}
+	return connutil.TryCloseWrite(c.Conn)
+}
+
+func (c *earlyHandshakeConn) CloseRead() error {
+	if c == nil {
+		return nil
+	}
+	return connutil.TryCloseRead(c.Conn)
 }
 
 func (c *earlyHandshakeConn) HTTPMaskEarlyHandshakeUserHash() string {

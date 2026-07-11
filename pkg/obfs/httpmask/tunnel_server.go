@@ -77,15 +77,21 @@ type TunnelServer struct {
 }
 
 type tunnelSession struct {
-	conn       net.Conn
-	lastActive time.Time
+	conn           net.Conn
+	lastActive     time.Time
+	uplinkClosed   bool
+	downlinkClosed bool
 }
+
+type sessionDirection uint8
+
+const (
+	sessionUplink sessionDirection = iota
+	sessionDownlink
+)
 
 func NewTunnelServer(opts TunnelServerOptions) *TunnelServer {
 	mode := normalizeTunnelMode(opts.Mode)
-	if mode == TunnelModeLegacy {
-		// Server-side "legacy" means: don't accept stream/poll; only passthrough.
-	}
 	pathRoot := normalizePathRoot(opts.PathRoot)
 	auth := newTunnelAuth(opts.AuthKey, opts.AuthSkew)
 	timeout := opts.PullReadTimeout
@@ -843,15 +849,40 @@ func (s *TunnelServer) sessionClose(token string) {
 }
 
 func (s *TunnelServer) sessionCloseWrite(token string) {
-	sess, ok := s.sessionGet(token)
-	if !ok || sess == nil || sess.conn == nil {
+	s.sessionHalfClose(token, sessionUplink)
+}
+
+func (s *TunnelServer) sessionHalfClose(token string, direction sessionDirection) {
+	var (
+		conn       net.Conn
+		closeWrite bool
+	)
+
+	s.mu.Lock()
+	sess, ok := s.sessions[token]
+	if !ok {
+		s.mu.Unlock()
 		return
 	}
-	if cw, ok := sess.conn.(interface{ CloseWrite() error }); ok {
-		_ = cw.CloseWrite()
-		return
+	sess.lastActive = time.Now()
+	switch direction {
+	case sessionUplink:
+		if !sess.uplinkClosed {
+			sess.uplinkClosed = true
+			closeWrite = true
+		}
+	case sessionDownlink:
+		sess.downlinkClosed = true
 	}
-	_ = sess.conn.Close()
+	if sess.uplinkClosed && sess.downlinkClosed {
+		delete(s.sessions, token)
+	}
+	conn = sess.conn
+	s.mu.Unlock()
+
+	if closeWrite {
+		_ = connutil.TryCloseWrite(conn)
+	}
 }
 
 func (s *TunnelServer) pollPush(rawConn net.Conn, token string, body io.Reader) (HandleResult, net.Conn, error) {
@@ -1010,9 +1041,9 @@ func (s *TunnelServer) sessionPull(rawConn net.Conn, token string, keepalive boo
 			}
 			return HandleDone, nil, nil
 		}
-		if errors.Is(err, io.EOF) || errors.Is(err, io.ErrClosedPipe) || errors.Is(err, net.ErrClosed) {
+		if errors.Is(err, io.EOF) {
 			streamEOF = true
-			s.sessionClose(token)
+			s.sessionHalfClose(token, sessionDownlink)
 			return HandleDone, nil, nil
 		}
 		s.sessionClose(token)

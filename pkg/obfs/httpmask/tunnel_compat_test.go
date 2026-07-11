@@ -534,6 +534,87 @@ func TestDialTunnel_HalfCloseDelayedResponse(t *testing.T) {
 	}
 }
 
+func TestDialTunnel_DownlinkHalfCloseKeepsUplink(t *testing.T) {
+	for _, mode := range []string{"stream", "poll", "auto"} {
+		t.Run(mode, func(t *testing.T) {
+			srv := NewTunnelServer(TunnelServerOptions{
+				Mode:            "auto",
+				PathRoot:        compatPathRoot,
+				AuthKey:         compatAuthKey,
+				PullReadTimeout: 50 * time.Millisecond,
+				SessionTTL:      3 * time.Second,
+			})
+			addr, stop, tunnelCh := startRawTunnelServer(t, srv)
+			defer stop()
+
+			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+			defer cancel()
+			client, err := DialTunnel(ctx, addr, TunnelDialOptions{
+				Mode:      mode,
+				PathRoot:  compatPathRoot,
+				AuthKey:   compatAuthKey,
+				Multiplex: "auto",
+			})
+			if err != nil {
+				t.Fatalf("dial %s: %v", mode, err)
+			}
+			defer client.Close()
+
+			server := waitForTunnelConn(t, tunnelCh)
+			defer server.Close()
+			type halfCloseResult struct {
+				tail []byte
+				err  error
+			}
+			serverDone := make(chan halfCloseResult, 1)
+			go func() {
+				if _, err := server.Write([]byte("response")); err != nil {
+					serverDone <- halfCloseResult{err: err}
+					return
+				}
+				if err := connutil.TryCloseWrite(server); err != nil {
+					serverDone <- halfCloseResult{err: err}
+					return
+				}
+				tail, err := io.ReadAll(server)
+				serverDone <- halfCloseResult{tail: tail, err: err}
+			}()
+
+			response, err := io.ReadAll(client)
+			if err != nil {
+				t.Fatalf("read response: %v", err)
+			}
+			if string(response) != "response" {
+				t.Fatalf("response = %q", response)
+			}
+			if _, err := client.Write([]byte("tail")); err != nil {
+				t.Fatalf("write tail after EOF: %v", err)
+			}
+			if err := connutil.TryCloseWrite(client); err != nil {
+				t.Fatalf("close tail: %v", err)
+			}
+
+			select {
+			case result := <-serverDone:
+				if result.err != nil {
+					t.Fatalf("server read tail: %v", result.err)
+				}
+				if string(result.tail) != "tail" {
+					t.Fatalf("server tail = %q", result.tail)
+				}
+			case <-time.After(5 * time.Second):
+				t.Fatal("server did not receive tail")
+			}
+			srv.mu.Lock()
+			sessionCount := len(srv.sessions)
+			srv.mu.Unlock()
+			if sessionCount != 0 {
+				t.Fatalf("sessions after both directions closed = %d, want 0", sessionCount)
+			}
+		})
+	}
+}
+
 func TestDialTunnel_WaitReadyConfirmsSplitSession(t *testing.T) {
 	for _, mode := range []string{"stream", "poll", "auto"} {
 		t.Run(mode, func(t *testing.T) {
