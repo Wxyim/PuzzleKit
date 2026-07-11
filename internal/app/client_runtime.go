@@ -1,8 +1,10 @@
 package app
 
 import (
+	"context"
 	"fmt"
 	"strings"
+	"sync"
 
 	"github.com/SUDOKU-ASCII/sudoku/internal/config"
 	"github.com/SUDOKU-ASCII/sudoku/internal/tunnel"
@@ -113,6 +115,49 @@ func buildOutboundDialer(runtimes []*clientRuntime) (tunnel.Dialer, error) {
 	}
 
 	return tunnel.NewBalancedDialer(nodes)
+}
+
+func startMuxWarmers(runtimes []*clientRuntime) func() {
+	ctx, cancel := context.WithCancel(context.Background())
+	var wg sync.WaitGroup
+	var muxDialers []*tunnel.MuxDialer
+
+	for _, rt := range runtimes {
+		muxDialer, ok := rt.Dialer.(*tunnel.MuxDialer)
+		if !ok {
+			continue
+		}
+		muxDialers = append(muxDialers, muxDialer)
+		wg.Add(1)
+		go func(nodeID string, dialer *tunnel.MuxDialer) {
+			defer wg.Done()
+			ready := false
+			failureReported := false
+			dialer.Maintain(ctx, func(err error) {
+				if err == nil {
+					if !ready {
+						logx.Infof("Mux", "Warm session ready for %s", nodeID)
+					}
+					ready = true
+					failureReported = false
+					return
+				}
+				if !failureReported {
+					logx.Warnf("Mux", "Warm session unavailable for %s: %v", nodeID, err)
+				}
+				ready = false
+				failureReported = true
+			})
+		}(rt.NodeID, muxDialer)
+	}
+
+	return func() {
+		cancel()
+		for _, dialer := range muxDialers {
+			_ = dialer.Close()
+		}
+		wg.Wait()
+	}
 }
 
 func clientNodeID(cfg *config.Config) string {

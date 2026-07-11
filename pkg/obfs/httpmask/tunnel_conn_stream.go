@@ -27,6 +27,7 @@ import (
 	"io"
 	"net"
 	"net/http"
+	"strings"
 	"time"
 )
 
@@ -37,6 +38,7 @@ func dialStream(ctx context.Context, serverAddress string, opts TunnelDialOption
 
 type streamSplitConn struct {
 	queuedConn
+	readiness *tunnelReadiness
 
 	ctx    context.Context
 	cancel context.CancelFunc
@@ -48,6 +50,7 @@ type streamSplitConn struct {
 	closeURL   string
 	headerHost string
 	auth       *tunnelAuth
+	waitSpare  func(context.Context) error
 }
 
 func (c *streamSplitConn) Close() error {
@@ -71,6 +74,7 @@ func dialStreamSplit(ctx context.Context, serverAddress string, opts TunnelDialO
 	c := &streamSplitConn{
 		ctx:        connCtx,
 		cancel:     cancel,
+		readiness:  newTunnelReadiness(),
 		client:     info.client,
 		pushURL:    info.pushURL,
 		pullURL:    info.pullURL,
@@ -88,6 +92,12 @@ func dialStreamSplit(ctx context.Context, serverAddress string, opts TunnelDialO
 		},
 	}
 
+	if strings.EqualFold(strings.TrimSpace(opts.Multiplex), "on") {
+		c.waitSpare = func(ctx context.Context) error {
+			return info.tunnelClient.waitPreconnect(ctx, c.closed, info.pushURL, 1)
+		}
+		go info.tunnelClient.maintainPreconnect(connCtx, info.pushURL, 1)
+	}
 	go c.pullLoop()
 	go c.pushLoop()
 	outConn := net.Conn(c)
@@ -100,7 +110,7 @@ func dialStreamSplit(ctx context.Context, serverAddress string, opts TunnelDialO
 		if upgraded != nil {
 			outConn = upgraded
 		}
-		return outConn, nil
+		return wrapReadyTunnelConn(outConn, c.waitReady), nil
 	}
 	if opts.Upgrade != nil {
 		upgraded, err := opts.Upgrade(c)
@@ -112,19 +122,26 @@ func dialStreamSplit(ctx context.Context, serverAddress string, opts TunnelDialO
 			outConn = upgraded
 		}
 	}
-	return outConn, nil
+	return wrapReadyTunnelConn(outConn, c.waitReady), nil
+}
+
+func (c *streamSplitConn) waitReady(ctx context.Context) error {
+	if err := c.readiness.wait(ctx, c.closed, c.closedErr); err != nil {
+		return err
+	}
+	if c.waitSpare != nil {
+		return c.waitSpare(ctx)
+	}
+	return nil
 }
 
 func (c *streamSplitConn) pullLoop() {
 	const (
-		// requestTimeout must be long enough for continuous high-throughput streams (e.g. mux + large downloads).
-		// If it is too short, the client cancels the response mid-body and corrupts the byte stream.
-		requestTimeout = 2 * time.Minute
-		readChunkSize  = 32 * 1024
-		idleBackoff    = 25 * time.Millisecond
-		maxDialRetry   = 12
-		minBackoff     = 10 * time.Millisecond
-		maxBackoff     = 250 * time.Millisecond
+		readChunkSize = 32 * 1024
+		idleBackoff   = 25 * time.Millisecond
+		maxDialRetry  = 12
+		minBackoff    = 10 * time.Millisecond
+		maxBackoff    = 250 * time.Millisecond
 	)
 
 	var (
@@ -139,7 +156,9 @@ func (c *streamSplitConn) pullLoop() {
 		default:
 		}
 
-		reqCtx, cancel := context.WithTimeout(c.ctx, requestTimeout)
+		// The server ends an idle pull after PullReadTimeout. A fixed client
+		// lifetime would instead cancel healthy continuous downloads mid-stream.
+		reqCtx, cancel := context.WithCancel(c.ctx)
 		req, err := http.NewRequestWithContext(reqCtx, http.MethodGet, c.pullURL, nil)
 		if err != nil {
 			cancel()
@@ -178,6 +197,7 @@ func (c *streamSplitConn) pullLoop() {
 			_ = c.Close()
 			return
 		}
+		c.readiness.markPullReady()
 
 		readAny := false
 		for {
@@ -262,6 +282,7 @@ func (c *streamSplitConn) pushLoop() {
 		}
 
 		buf.Reset()
+		c.readiness.markPushReady()
 		return nil
 	}
 

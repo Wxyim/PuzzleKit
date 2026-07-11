@@ -27,6 +27,7 @@ import (
 	"net"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 )
 
@@ -45,7 +46,8 @@ const (
 	muxMaxFrameSize            = 256 * 1024
 	// Larger data frames materially reduce per-frame lock/copy overhead for
 	// single-tunnel large downloads while still staying well below the hard cap.
-	muxMaxDataPayload = 128 * 1024
+	muxMaxDataPayload    = 128 * 1024
+	muxKeepaliveInterval = 15 * time.Second
 )
 
 var errMuxReceiveQueueFull = errors.New("mux receive queue full")
@@ -63,6 +65,9 @@ type muxSession struct {
 	closeOnce sync.Once
 	closeErr  error
 
+	lastWrite     atomic.Int64
+	keepaliveOnce sync.Once
+
 	onOpen func(stream *muxStream, payload []byte)
 }
 
@@ -73,6 +78,7 @@ func newMuxSession(conn net.Conn, onOpen func(stream *muxStream, payload []byte)
 		closed:  make(chan struct{}),
 		onOpen:  onOpen,
 	}
+	s.lastWrite.Store(time.Now().UnixNano())
 	go s.readLoop()
 	return s
 }
@@ -178,7 +184,36 @@ func (s *muxSession) sendFrame(frameType byte, streamID uint32, payload []byte) 
 			return err
 		}
 	}
+	s.lastWrite.Store(time.Now().UnixNano())
 	return nil
+}
+
+func (s *muxSession) startKeepalive(interval time.Duration) {
+	if s == nil || interval <= 0 {
+		return
+	}
+	s.keepaliveOnce.Do(func() {
+		go func() {
+			ticker := time.NewTicker(interval)
+			defer ticker.Stop()
+			for {
+				select {
+				case <-ticker.C:
+					lastWrite := time.Unix(0, s.lastWrite.Load())
+					if time.Since(lastWrite) < interval {
+						continue
+					}
+					// Stream 0 is never allocated. Existing peers, including
+					// v0.4.7, ignore DATA for unknown streams.
+					if err := s.sendFrame(muxFrameData, 0, nil); err != nil {
+						return
+					}
+				case <-s.closed:
+					return
+				}
+			}
+		}()
+	})
 }
 
 func (s *muxSession) sendReset(streamID uint32, msg string) {

@@ -29,10 +29,14 @@ import (
 	"github.com/SUDOKU-ASCII/sudoku/pkg/dnsutil"
 )
 
-const preconnectedConnTTL = 10 * time.Second
+// v0.4.7 servers stop waiting for the first HTTP request after five seconds.
+// Rotate raw preconnections before that deadline so a warmed upload never
+// hands net/http a socket the peer has already closed.
+const preconnectedConnTTL = 4 * time.Second
 
 type preparedConn struct {
-	conn net.Conn
+	conn      net.Conn
+	expiresAt time.Time
 }
 
 type preparedConnPool struct {
@@ -40,11 +44,15 @@ type preparedConnPool struct {
 	ready   []*preparedConn
 	pending int
 	changed chan struct{}
+	refill  chan struct{}
 	closed  bool
 }
 
 func newPreparedConnPool() *preparedConnPool {
-	return &preparedConnPool{changed: make(chan struct{})}
+	return &preparedConnPool{
+		changed: make(chan struct{}),
+		refill:  make(chan struct{}, 1),
+	}
 }
 
 func (p *preparedConnPool) notifyLocked() {
@@ -52,9 +60,34 @@ func (p *preparedConnPool) notifyLocked() {
 	p.changed = make(chan struct{})
 }
 
+func (p *preparedConnPool) requestRefillLocked() {
+	select {
+	case p.refill <- struct{}{}:
+	default:
+	}
+}
+
 func (p *preparedConnPool) prepare(
 	ctx context.Context,
 	count int,
+	dial func(context.Context) (net.Conn, error),
+	done func(),
+) {
+	p.prepareInternal(ctx, count, false, dial, done)
+}
+
+func (p *preparedConnPool) ensure(
+	ctx context.Context,
+	count int,
+	dial func(context.Context) (net.Conn, error),
+) {
+	p.prepareInternal(ctx, count, true, dial, nil)
+}
+
+func (p *preparedConnPool) prepareInternal(
+	ctx context.Context,
+	count int,
+	ensure bool,
 	dial func(context.Context) (net.Conn, error),
 	done func(),
 ) {
@@ -73,6 +106,16 @@ func (p *preparedConnPool) prepare(
 		}
 		return
 	}
+	if ensure {
+		count -= len(p.ready) + p.pending
+		if count <= 0 {
+			p.mu.Unlock()
+			if done != nil {
+				done()
+			}
+			return
+		}
+	}
 	p.pending += count
 	p.notifyLocked()
 	p.mu.Unlock()
@@ -88,7 +131,10 @@ func (p *preparedConnPool) prepare(
 			p.mu.Lock()
 			p.pending--
 			if err == nil && conn != nil && !p.closed {
-				item := &preparedConn{conn: conn}
+				item := &preparedConn{
+					conn:      conn,
+					expiresAt: time.Now().Add(preconnectedConnTTL),
+				}
 				p.ready = append(p.ready, item)
 				p.notifyLocked()
 				p.mu.Unlock()
@@ -122,7 +168,16 @@ func (p *preparedConnPool) take(ctx context.Context) (net.Conn, bool, error) {
 			item := p.ready[0]
 			p.ready[0] = nil
 			p.ready = p.ready[1:]
+			p.notifyLocked()
+			p.requestRefillLocked()
 			p.mu.Unlock()
+			if item == nil || item.conn == nil {
+				continue
+			}
+			if !item.expiresAt.IsZero() && !time.Now().Before(item.expiresAt) {
+				_ = item.conn.Close()
+				continue
+			}
 			return item.conn, true, nil
 		}
 		if p.pending == 0 || p.closed {
@@ -140,8 +195,49 @@ func (p *preparedConnPool) take(ctx context.Context) (net.Conn, bool, error) {
 	}
 }
 
+func (p *preparedConnPool) waitReady(ctx context.Context, closed <-chan struct{}, count int) error {
+	if p == nil || count <= 0 {
+		return nil
+	}
+	if ctx == nil {
+		ctx = context.Background()
+	}
+
+	for {
+		select {
+		case <-closed:
+			return net.ErrClosed
+		default:
+		}
+
+		p.mu.Lock()
+		if len(p.ready) >= count {
+			p.mu.Unlock()
+			return nil
+		}
+		if p.closed {
+			p.mu.Unlock()
+			return net.ErrClosed
+		}
+		changed := p.changed
+		p.mu.Unlock()
+
+		select {
+		case <-changed:
+		case <-closed:
+			return net.ErrClosed
+		case <-ctx.Done():
+			return ctx.Err()
+		}
+	}
+}
+
 func (p *preparedConnPool) expire(item *preparedConn) {
-	timer := time.NewTimer(preconnectedConnTTL)
+	delay := time.Until(item.expiresAt)
+	if delay < 0 {
+		delay = 0
+	}
+	timer := time.NewTimer(delay)
 	defer timer.Stop()
 	<-timer.C
 
@@ -154,6 +250,7 @@ func (p *preparedConnPool) expire(item *preparedConn) {
 		p.ready[len(p.ready)-1] = nil
 		p.ready = p.ready[:len(p.ready)-1]
 		p.notifyLocked()
+		p.requestRefillLocked()
 		p.mu.Unlock()
 		_ = item.conn.Close()
 		return
@@ -221,6 +318,41 @@ func (d *preconnectDialer) preconnect(ctx context.Context, tlsEnabled bool, coun
 		return d.dialFresh(dialCtx, "tcp", d.urlHost)
 	}, cancel)
 	return cancel
+}
+
+func (d *preconnectDialer) maintainPreconnect(ctx context.Context, tlsEnabled bool, count int) {
+	if d == nil || d.pool == nil || count <= 0 {
+		return
+	}
+	if ctx == nil {
+		ctx = context.Background()
+	}
+
+	const retryInterval = 500 * time.Millisecond
+	ticker := time.NewTicker(retryInterval)
+	defer ticker.Stop()
+
+	ensure := func() {
+		d.pool.ensure(ctx, count, func(ctx context.Context) (net.Conn, error) {
+			dialCtx, cancel := context.WithTimeout(ctx, tunnelTLSHandshakeTimeout)
+			defer cancel()
+			if tlsEnabled {
+				return d.dialTLSFresh(dialCtx, "tcp", d.urlHost)
+			}
+			return d.dialFresh(dialCtx, "tcp", d.urlHost)
+		})
+	}
+
+	ensure()
+	for {
+		select {
+		case <-ticker.C:
+		case <-d.pool.refill:
+		case <-ctx.Done():
+			return
+		}
+		ensure()
+	}
 }
 
 func (d *preconnectDialer) dialContext(ctx context.Context, network, addr string) (net.Conn, error) {

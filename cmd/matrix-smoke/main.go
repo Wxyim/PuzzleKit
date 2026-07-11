@@ -598,31 +598,23 @@ func smokeForward(ctx context.Context, cfg *config.Config, tables []*sudoku.Tabl
 }
 
 func smokeMux(ctx context.Context, cfg *config.Config, tables []*sudoku.Table, target1, target2 string) error {
-	base := tunnel.BaseDialer{
-		Config: cfg,
-		Tables: tables,
+	dialer := &tunnel.MuxDialer{
+		BaseDialer: tunnel.BaseDialer{
+			Config: cfg,
+			Tables: tables,
+		},
 	}
-	baseConn, err := base.DialBase()
-	if err != nil {
-		return err
+	defer dialer.Close()
+	if err := dialer.Warm(ctx); err != nil {
+		return fmt.Errorf("warm mux failed: %w", err)
 	}
-	if err := tunnel.WriteKIPMessage(baseConn, tunnel.KIPTypeStartMux, nil); err != nil {
-		_ = baseConn.Close()
-		return fmt.Errorf("start mux failed: %w", err)
-	}
-	mc, err := tunnel.NewMuxClient(baseConn)
-	if err != nil {
-		_ = baseConn.Close()
-		return err
-	}
-	defer mc.Close()
 
-	c1, err := mc.Dial(target1)
+	c1, err := dialer.Dial(target1)
 	if err != nil {
 		return err
 	}
 	defer c1.Close()
-	c2, err := mc.Dial(target2)
+	c2, err := dialer.Dial(target2)
 	if err != nil {
 		return err
 	}
@@ -657,7 +649,6 @@ func smokeMux(ctx context.Context, cfg *config.Config, tables []*sudoku.Table, t
 	if !bytes.Equal(r1, p1) || !bytes.Equal(r2, p2) {
 		return fmt.Errorf("mux echo mismatch")
 	}
-	_ = ctx
 	return nil
 }
 

@@ -39,6 +39,7 @@ const (
 	tunnelEarlyDataQueryKey   = "ed"
 	tunnelEarlyDataHeader     = "X-Sudoku-Early"
 	tunnelPreconnectCount     = 3
+	tunnelMuxPreconnectCount  = tunnelPreconnectCount + 1
 	tunnelTLSHandshakeTimeout = 10 * time.Second
 )
 
@@ -69,6 +70,13 @@ func canonicalHeaderHost(urlHost, scheme string) string {
 		return "[" + host + "]"
 	}
 	return host
+}
+
+func sessionPreconnectCount(multiplex string) int {
+	if strings.EqualFold(strings.TrimSpace(multiplex), "on") {
+		return tunnelMuxPreconnectCount
+	}
+	return tunnelPreconnectCount
 }
 
 func parseAuthorizeResponse(body []byte) (*authorizeResponse, error) {
@@ -142,13 +150,14 @@ func parseEarlyDataQuery(u *url.URL) ([]byte, error) {
 }
 
 type sessionDialInfo struct {
-	client     *http.Client
-	pushURL    string
-	pullURL    string
-	finURL     string
-	closeURL   string
-	headerHost string
-	auth       *tunnelAuth
+	client       *http.Client
+	tunnelClient *tunnelHTTPClient
+	pushURL      string
+	pullURL      string
+	finURL       string
+	closeURL     string
+	headerHost   string
+	auth         *tunnelAuth
 }
 
 type transportKey struct {
@@ -198,6 +207,40 @@ func (c *tunnelHTTPClient) preconnect(ctx context.Context, req *http.Request, co
 		}
 	}
 	return c.transport.dialer.preconnect(ctx, req.URL.Scheme == "https", count)
+}
+
+func (c *tunnelHTTPClient) directPreconnectTarget(rawURL string) (*preconnectDialer, bool, bool) {
+	if c == nil || c.transport == nil || c.transport.transport == nil || c.transport.dialer == nil ||
+		strings.TrimSpace(rawURL) == "" {
+		return nil, false, false
+	}
+	req, err := http.NewRequest(http.MethodPost, rawURL, nil)
+	if err != nil {
+		return nil, false, false
+	}
+	if proxy := c.transport.transport.Proxy; proxy != nil {
+		proxyURL, err := proxy(req)
+		if err != nil || proxyURL != nil {
+			return nil, false, false
+		}
+	}
+	return c.transport.dialer, req.URL.Scheme == "https", true
+}
+
+func (c *tunnelHTTPClient) maintainPreconnect(ctx context.Context, rawURL string, count int) {
+	dialer, tlsEnabled, ok := c.directPreconnectTarget(rawURL)
+	if !ok || count <= 0 {
+		return
+	}
+	dialer.maintainPreconnect(ctx, tlsEnabled, count)
+}
+
+func (c *tunnelHTTPClient) waitPreconnect(ctx context.Context, closed <-chan struct{}, rawURL string, count int) error {
+	dialer, _, ok := c.directPreconnectTarget(rawURL)
+	if !ok || count <= 0 {
+		return nil
+	}
+	return dialer.pool.waitReady(ctx, closed, count)
 }
 
 // transportCache bounds the memory footprint of globally reused HTTP transports and dialers.
@@ -349,7 +392,9 @@ func dialSession(ctx context.Context, serverAddress string, opts TunnelDialOptio
 	applyTunnelAuth(req, auth, mode, http.MethodGet, "/session")
 
 	// Overlap the authorization, initial pull, and initial push connection handshakes.
-	cancelPreconnect := httpClient.preconnect(ctx, req, tunnelPreconnectCount)
+	// Authorization, pull, and the mux preface consume three connections.
+	// Native mux keeps one more ready for the first user-visible OPEN upload.
+	cancelPreconnect := httpClient.preconnect(ctx, req, sessionPreconnectCount(opts.Multiplex))
 	keepPreconnected := false
 	defer func() {
 		if !keepPreconnected {
@@ -391,13 +436,14 @@ func dialSession(ctx context.Context, serverAddress string, opts TunnelDialOptio
 	keepPreconnected = true
 
 	return &sessionDialInfo{
-		client:     httpClient.client,
-		pushURL:    pushURL,
-		pullURL:    pullURL,
-		finURL:     finURL,
-		closeURL:   closeURL,
-		headerHost: headerHost,
-		auth:       auth,
+		client:       httpClient.client,
+		tunnelClient: httpClient,
+		pushURL:      pushURL,
+		pullURL:      pullURL,
+		finURL:       finURL,
+		closeURL:     closeURL,
+		headerHost:   headerHost,
+		auth:         auth,
 	}, nil
 }
 

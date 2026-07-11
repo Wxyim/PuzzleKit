@@ -28,11 +28,13 @@ import (
 	"io"
 	"net"
 	"net/http"
+	"strings"
 	"time"
 )
 
 type pollConn struct {
 	queuedConn
+	readiness *tunnelReadiness
 
 	ctx    context.Context
 	cancel context.CancelFunc
@@ -44,6 +46,7 @@ type pollConn struct {
 	closeURL   string
 	headerHost string
 	auth       *tunnelAuth
+	waitSpare  func(context.Context) error
 }
 
 func (c *pollConn) closeWithError(err error) error {
@@ -69,6 +72,7 @@ func dialPoll(ctx context.Context, serverAddress string, opts TunnelDialOptions)
 	c := &pollConn{
 		ctx:        connCtx,
 		cancel:     cancel,
+		readiness:  newTunnelReadiness(),
 		client:     info.client,
 		pushURL:    info.pushURL,
 		pullURL:    info.pullURL,
@@ -86,6 +90,12 @@ func dialPoll(ctx context.Context, serverAddress string, opts TunnelDialOptions)
 		},
 	}
 
+	if strings.EqualFold(strings.TrimSpace(opts.Multiplex), "on") {
+		c.waitSpare = func(ctx context.Context) error {
+			return info.tunnelClient.waitPreconnect(ctx, c.closed, info.pushURL, 1)
+		}
+		go info.tunnelClient.maintainPreconnect(connCtx, info.pushURL, 1)
+	}
 	go c.pullLoop()
 	go c.pushLoop()
 	outConn := net.Conn(c)
@@ -98,7 +108,7 @@ func dialPoll(ctx context.Context, serverAddress string, opts TunnelDialOptions)
 		if upgraded != nil {
 			outConn = upgraded
 		}
-		return outConn, nil
+		return wrapReadyTunnelConn(outConn, c.waitReady), nil
 	}
 	if opts.Upgrade != nil {
 		upgraded, err := opts.Upgrade(c)
@@ -110,7 +120,17 @@ func dialPoll(ctx context.Context, serverAddress string, opts TunnelDialOptions)
 			outConn = upgraded
 		}
 	}
-	return outConn, nil
+	return wrapReadyTunnelConn(outConn, c.waitReady), nil
+}
+
+func (c *pollConn) waitReady(ctx context.Context) error {
+	if err := c.readiness.wait(ctx, c.closed, c.closedErr); err != nil {
+		return err
+	}
+	if c.waitSpare != nil {
+		return c.waitSpare(ctx)
+	}
+	return nil
 }
 
 func (c *pollConn) pullLoop() {
@@ -166,6 +186,7 @@ func (c *pollConn) pullLoop() {
 			_ = c.closeWithError(fmt.Errorf("poll pull bad status: %s", resp.Status))
 			return
 		}
+		c.readiness.markPullReady()
 
 		scanner := bufio.NewScanner(resp.Body)
 		for scanner.Scan() {
@@ -242,6 +263,7 @@ func (c *pollConn) pushLoop() {
 
 		buf.Reset()
 		pendingRaw = 0
+		c.readiness.markPushReady()
 		return nil
 	}
 

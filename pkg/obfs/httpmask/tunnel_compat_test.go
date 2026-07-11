@@ -24,6 +24,7 @@ import (
 	"context"
 	"crypto/x509"
 	"encoding/base64"
+	"errors"
 	"fmt"
 	"io"
 	"net"
@@ -115,6 +116,126 @@ func TestTunnelHTTPClient_PreconnectsTLSHandshakes(t *testing.T) {
 	}
 }
 
+func TestPreconnectDialer_MaintainsSpareConnection(t *testing.T) {
+	listener, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("listen: %v", err)
+	}
+	defer listener.Close()
+
+	accepted := make(chan net.Conn, 4)
+	go func() {
+		for {
+			conn, err := listener.Accept()
+			if err != nil {
+				return
+			}
+			accepted <- conn
+		}
+	}()
+
+	dialer := newPreconnectDialer(listener.Addr().String(), listener.Addr().String(), "", nil)
+	defer dialer.close()
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	go dialer.maintainPreconnect(ctx, false, 1)
+
+	waitForSpare := func() {
+		t.Helper()
+		deadline := time.Now().Add(2 * time.Second)
+		for time.Now().Before(deadline) {
+			dialer.pool.mu.Lock()
+			ready := len(dialer.pool.ready)
+			dialer.pool.mu.Unlock()
+			if ready >= 1 {
+				return
+			}
+			time.Sleep(time.Millisecond)
+		}
+		t.Fatal("spare connection was not prepared")
+	}
+
+	waitForSpare()
+	select {
+	case conn := <-accepted:
+		_ = conn.Close()
+	case <-time.After(2 * time.Second):
+		t.Fatal("initial spare connection was not accepted")
+	}
+	first, ok, err := dialer.pool.take(context.Background())
+	if err != nil || !ok || first == nil {
+		t.Fatalf("take first spare: conn=%v ok=%v err=%v", first, ok, err)
+	}
+	_ = first.Close()
+	select {
+	case conn := <-accepted:
+		_ = conn.Close()
+	case <-time.After(250 * time.Millisecond):
+		t.Fatal("maintainer did not immediately replenish the consumed connection")
+	}
+	waitForSpare()
+}
+
+func TestSessionPreconnectCount(t *testing.T) {
+	for _, tc := range []struct {
+		mode string
+		want int
+	}{
+		{mode: "off", want: tunnelPreconnectCount},
+		{mode: "auto", want: tunnelPreconnectCount},
+		{mode: "on", want: tunnelMuxPreconnectCount},
+		{mode: " ON ", want: tunnelMuxPreconnectCount},
+	} {
+		if got := sessionPreconnectCount(tc.mode); got != tc.want {
+			t.Fatalf("sessionPreconnectCount(%q) = %d, want %d", tc.mode, got, tc.want)
+		}
+	}
+}
+
+func TestPreparedConnPool_WaitReadyStopsOnTunnelClose(t *testing.T) {
+	pool := newPreparedConnPool()
+	closed := make(chan struct{})
+	done := make(chan error, 1)
+	go func() {
+		done <- pool.waitReady(context.Background(), closed, 1)
+	}()
+
+	close(closed)
+	select {
+	case err := <-done:
+		if err != net.ErrClosed {
+			t.Fatalf("wait ready error = %v, want %v", err, net.ErrClosed)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("wait ready did not stop after tunnel close")
+	}
+}
+
+func TestPreparedConnPool_DoesNotReturnExpiredConnection(t *testing.T) {
+	pool := newPreparedConnPool()
+	client, peer := net.Pipe()
+	defer peer.Close()
+
+	pool.ready = append(pool.ready, &preparedConn{
+		conn:      client,
+		expiresAt: time.Now().Add(-time.Second),
+	})
+
+	conn, ok, err := pool.take(context.Background())
+	if err != nil {
+		t.Fatalf("take expired connection: %v", err)
+	}
+	if ok || conn != nil {
+		t.Fatalf("expired connection was returned: conn=%v ok=%v", conn, ok)
+	}
+
+	_ = peer.SetReadDeadline(time.Now().Add(time.Second))
+	var b [1]byte
+	if _, err := peer.Read(b[:]); !errors.Is(err, io.EOF) {
+		t.Fatalf("expired connection was not closed: %v", err)
+	}
+}
+
 func TestDialTunnel_BidirectionalSmoke(t *testing.T) {
 	for _, mode := range []string{"stream", "poll", "ws", "auto"} {
 		t.Run(mode, func(t *testing.T) {
@@ -145,6 +266,78 @@ func TestDialTunnel_BidirectionalSmoke(t *testing.T) {
 			server := waitForTunnelConn(t, tunnelCh)
 			defer server.Close()
 			assertBidirectionalExchange(t, client, server)
+		})
+	}
+}
+
+func TestDialTunnel_WaitReadyConfirmsSplitSession(t *testing.T) {
+	for _, mode := range []string{"stream", "poll", "auto"} {
+		t.Run(mode, func(t *testing.T) {
+			srv := NewTunnelServer(TunnelServerOptions{
+				Mode:            "auto",
+				PathRoot:        compatPathRoot,
+				AuthKey:         compatAuthKey,
+				PullReadTimeout: 50 * time.Millisecond,
+				SessionTTL:      3 * time.Second,
+			})
+			addr, stop, tunnelCh := startRawTunnelServer(t, srv)
+			defer stop()
+
+			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+			defer cancel()
+			client, err := DialTunnel(ctx, addr, TunnelDialOptions{
+				Mode:       mode,
+				PathRoot:   compatPathRoot,
+				AuthKey:    compatAuthKey,
+				Multiplex:  "on",
+				TLSEnabled: false,
+			})
+			if err != nil {
+				t.Fatalf("dial %s: %v", mode, err)
+			}
+			defer client.Close()
+
+			server := waitForTunnelConn(t, tunnelCh)
+			defer server.Close()
+			payload := []byte("mux-start-placeholder")
+			readDone := make(chan error, 1)
+			go func() {
+				got := make([]byte, len(payload))
+				_, err := io.ReadFull(server, got)
+				if err == nil && !bytes.Equal(got, payload) {
+					err = fmt.Errorf("uplink = %q, want %q", got, payload)
+				}
+				readDone <- err
+			}()
+
+			if _, err := client.Write(payload); err != nil {
+				t.Fatalf("queue initial upload: %v", err)
+			}
+			readyCtx, readyCancel := context.WithTimeout(context.Background(), 2*time.Second)
+			defer readyCancel()
+			if err := WaitTunnelReady(readyCtx, client); err != nil {
+				t.Fatalf("wait ready: %v", err)
+			}
+			select {
+			case err := <-readDone:
+				if err != nil {
+					t.Fatalf("server read: %v", err)
+				}
+			case <-time.After(time.Second):
+				t.Fatal("upload was not delivered before readiness")
+			}
+
+			downlink := []byte("ready-downlink")
+			if _, err := server.Write(downlink); err != nil {
+				t.Fatalf("server write: %v", err)
+			}
+			got := make([]byte, len(downlink))
+			if _, err := io.ReadFull(client, got); err != nil {
+				t.Fatalf("client read: %v", err)
+			}
+			if !bytes.Equal(got, downlink) {
+				t.Fatalf("downlink = %q, want %q", got, downlink)
+			}
 		})
 	}
 }

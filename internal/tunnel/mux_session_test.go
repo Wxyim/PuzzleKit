@@ -21,12 +21,39 @@ package tunnel
 
 import (
 	"context"
+	"encoding/binary"
 	"errors"
 	"io"
 	"net"
 	"testing"
 	"time"
 )
+
+func TestMuxSession_KeepaliveUsesV047CompatibleFrame(t *testing.T) {
+	clientConn, peerConn := net.Pipe()
+	session := newMuxSession(clientConn, nil)
+	t.Cleanup(func() {
+		session.closeWithError(net.ErrClosed)
+		_ = peerConn.Close()
+	})
+
+	session.startKeepalive(10 * time.Millisecond)
+	_ = peerConn.SetReadDeadline(time.Now().Add(time.Second))
+
+	var header [muxHeaderSize]byte
+	if _, err := io.ReadFull(peerConn, header[:]); err != nil {
+		t.Fatalf("read keepalive: %v", err)
+	}
+	if header[0] != muxFrameData {
+		t.Fatalf("keepalive frame type = %d, want DATA", header[0])
+	}
+	if streamID := binary.BigEndian.Uint32(header[1:5]); streamID != 0 {
+		t.Fatalf("keepalive stream id = %d, want 0", streamID)
+	}
+	if payloadLen := binary.BigEndian.Uint32(header[5:9]); payloadLen != 0 {
+		t.Fatalf("keepalive payload length = %d, want 0", payloadLen)
+	}
+}
 
 func TestMuxSession_Echo(t *testing.T) {
 	clientConn, serverConn := net.Pipe()
