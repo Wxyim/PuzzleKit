@@ -628,7 +628,7 @@ func writeSessionPullResponseHeader(w io.Writer) error {
 			"Trailer: "+tunnelStreamEOFHeader+"\r\n"+
 			"Cache-Control: no-store\r\n"+
 			"Pragma: no-cache\r\n"+
-			"Connection: keep-alive\r\n"+
+			"Connection: close\r\n"+
 			"X-Accel-Buffering: no\r\n"+
 			"\r\n")
 	return err
