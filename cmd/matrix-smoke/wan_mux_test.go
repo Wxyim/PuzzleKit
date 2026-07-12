@@ -2,6 +2,7 @@ package main
 
 import (
 	"bufio"
+	"bytes"
 	"context"
 	"fmt"
 	"io"
@@ -19,6 +20,7 @@ import (
 
 	"github.com/SUDOKU-ASCII/sudoku/internal/config"
 	"github.com/SUDOKU-ASCII/sudoku/internal/tunnel"
+	"github.com/SUDOKU-ASCII/sudoku/pkg/connutil"
 	"github.com/SUDOKU-ASCII/sudoku/pkg/obfs/httpmask"
 	"github.com/SUDOKU-ASCII/sudoku/pkg/obfs/sudoku"
 )
@@ -309,6 +311,175 @@ func TestWAN200msLossyStreamMuxStability(t *testing.T) {
 	t.Logf("loss-like WAN stability: duration=%v requests=%d worst_204=%v", duration, requests, worst)
 }
 
+func TestWAN200msLossyAutoReuseHalfClose(t *testing.T) {
+	requireWANSimulation(t)
+
+	harness := newWANMuxHarness(t, wanProfile{
+		oneWayDelay:    100 * time.Millisecond,
+		jitter:         20 * time.Millisecond,
+		retransmitEach: 11,
+		retransmitWait: 200 * time.Millisecond,
+	})
+	targetAddr := startWANHalfCloseTarget(t, 50*time.Millisecond)
+	clientCfg := newWANClientConfig(t, "auto", harness.proxy.addr())
+	clientCfg.Multiplex = "auto"
+	clientCfg.HTTPMask.Multiplex = "auto"
+	if err := clientCfg.Finalize(); err != nil {
+		t.Fatalf("finalize auto-reuse WAN client: %v", err)
+	}
+	dialer := &tunnel.StandardDialer{BaseDialer: tunnel.BaseDialer{
+		Config: clientCfg,
+		Tables: harness.tables,
+	}}
+
+	for i := range 12 {
+		conn, err := dialer.Dial(targetAddr)
+		if err != nil {
+			t.Fatalf("dial %d: %v", i, err)
+		}
+		payload := []byte(fmt.Sprintf("wan-auto-reuse-%02d", i))
+		if err := writeFull(conn, payload); err != nil {
+			_ = conn.Close()
+			t.Fatalf("write %d: %v", i, err)
+		}
+		if closeWriter, ok := conn.(interface{ CloseWrite() error }); !ok {
+			_ = conn.Close()
+			t.Fatalf("connection %d does not support CloseWrite", i)
+		} else if err := closeWriter.CloseWrite(); err != nil {
+			_ = conn.Close()
+			t.Fatalf("close write %d: %v", i, err)
+		}
+
+		want := append([]byte("response:"), payload...)
+		readDone := make(chan struct {
+			payload []byte
+			err     error
+		}, 1)
+		go func() {
+			got, err := io.ReadAll(conn)
+			readDone <- struct {
+				payload []byte
+				err     error
+			}{payload: got, err: err}
+		}()
+		select {
+		case result := <-readDone:
+			_ = conn.Close()
+			if result.err != nil {
+				t.Fatalf("read %d: %v", i, result.err)
+			}
+			if !bytes.Equal(result.payload, want) {
+				t.Fatalf("response %d = %q, want %q", i, result.payload, want)
+			}
+		case <-time.After(10 * time.Second):
+			_ = conn.Close()
+			t.Fatalf("read %d timed out", i)
+		}
+	}
+}
+
+func TestWAN200msLossyDownlinkHalfCloseKeepsUplink(t *testing.T) {
+	requireWANSimulation(t)
+
+	harness := newWANMuxHarness(t, wanProfile{
+		oneWayDelay:    100 * time.Millisecond,
+		jitter:         20 * time.Millisecond,
+		retransmitEach: 11,
+		retransmitWait: 200 * time.Millisecond,
+	})
+	targetAddr, targetResults := startWANDirectionalHalfCloseTarget(t)
+
+	for _, mode := range []string{"stream", "poll", "auto"} {
+		t.Run(mode, func(t *testing.T) {
+			clientCfg := newWANClientConfig(t, mode, harness.proxy.addr())
+			clientCfg.Multiplex = "auto"
+			clientCfg.HTTPMask.Multiplex = "auto"
+			if err := clientCfg.Finalize(); err != nil {
+				t.Fatalf("finalize %s WAN client: %v", mode, err)
+			}
+			dialer := &tunnel.StandardDialer{BaseDialer: tunnel.BaseDialer{
+				Config: clientCfg,
+				Tables: harness.tables,
+			}}
+
+			conn, err := dialer.Dial(targetAddr)
+			if err != nil {
+				t.Fatalf("dial: %v", err)
+			}
+			relayed := relayWANConn(t, conn)
+			defer relayed.Close()
+			if err := writeFull(relayed, []byte("start")); err != nil {
+				t.Fatalf("write start: %v", err)
+			}
+			response, err := io.ReadAll(relayed)
+			if err != nil {
+				t.Fatalf("read response: %v", err)
+			}
+			if string(response) != "response" {
+				t.Fatalf("response = %q", response)
+			}
+			if err := writeFull(relayed, []byte("tail")); err != nil {
+				t.Fatalf("write tail after EOF: %v", err)
+			}
+			if closeWriter, ok := relayed.(interface{ CloseWrite() error }); !ok {
+				t.Fatal("connection does not support CloseWrite")
+			} else if err := closeWriter.CloseWrite(); err != nil {
+				t.Fatalf("close tail: %v", err)
+			}
+			select {
+			case result := <-targetResults:
+				if result.err != nil {
+					t.Fatalf("target exchange: %v", result.err)
+				}
+				if string(result.tail) != "tail" {
+					t.Fatalf("target tail = %q", result.tail)
+				}
+			case <-time.After(10 * time.Second):
+				t.Fatal("target did not receive tail")
+			}
+		})
+	}
+}
+
+func relayWANConn(t testing.TB, target net.Conn) net.Conn {
+	t.Helper()
+	listener, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		_ = target.Close()
+		t.Fatalf("listen relay: %v", err)
+	}
+	type acceptResult struct {
+		conn net.Conn
+		err  error
+	}
+	accepted := make(chan acceptResult, 1)
+	go func() {
+		conn, err := listener.Accept()
+		accepted <- acceptResult{conn: conn, err: err}
+	}()
+	client, err := net.Dial("tcp", listener.Addr().String())
+	if err != nil {
+		_ = listener.Close()
+		_ = target.Close()
+		t.Fatalf("dial relay: %v", err)
+	}
+	result := <-accepted
+	_ = listener.Close()
+	if result.err != nil {
+		_ = client.Close()
+		_ = target.Close()
+		t.Fatalf("accept relay: %v", result.err)
+	}
+	proxy := result.conn
+	go connutil.PipeConn(proxy, target)
+	t.Cleanup(func() {
+		_ = client.Close()
+		_ = proxy.Close()
+		_ = target.Close()
+	})
+	return client
+}
+
 func TestWANMuxKeepaliveSurvivesIdleCarrierTimeout(t *testing.T) {
 	requireWANSimulation(t)
 
@@ -332,6 +503,78 @@ func TestWANMuxKeepaliveSurvivesIdleCarrierTimeout(t *testing.T) {
 	if _, err := measureMuxHTTP204(dialer, harness.originAddr); err != nil {
 		t.Fatalf("mux carrier did not survive idle cutoff: %v", err)
 	}
+}
+
+func startWANHalfCloseTarget(t testing.TB, delay time.Duration) string {
+	t.Helper()
+	return startWANTarget(t, func(conn net.Conn) {
+		payload, err := io.ReadAll(conn)
+		if err != nil {
+			return
+		}
+		time.Sleep(delay)
+		_, _ = conn.Write(append([]byte("response:"), payload...))
+	})
+}
+
+type wanDirectionalHalfCloseResult struct {
+	tail []byte
+	err  error
+}
+
+func startWANDirectionalHalfCloseTarget(t testing.TB) (string, <-chan wanDirectionalHalfCloseResult) {
+	t.Helper()
+	results := make(chan wanDirectionalHalfCloseResult, 3)
+	addr := startWANTarget(t, func(conn net.Conn) {
+		start := make([]byte, len("start"))
+		if _, err := io.ReadFull(conn, start); err != nil {
+			results <- wanDirectionalHalfCloseResult{err: err}
+			return
+		}
+		if string(start) != "start" {
+			results <- wanDirectionalHalfCloseResult{err: fmt.Errorf("start = %q", start)}
+			return
+		}
+		if _, err := conn.Write([]byte("response")); err != nil {
+			results <- wanDirectionalHalfCloseResult{err: err}
+			return
+		}
+		tcpConn, ok := conn.(*net.TCPConn)
+		if !ok {
+			results <- wanDirectionalHalfCloseResult{err: fmt.Errorf("target conn is %T", conn)}
+			return
+		}
+		if err := tcpConn.CloseWrite(); err != nil {
+			results <- wanDirectionalHalfCloseResult{err: err}
+			return
+		}
+		tail, err := io.ReadAll(conn)
+		results <- wanDirectionalHalfCloseResult{tail: tail, err: err}
+	})
+	return addr, results
+}
+
+func startWANTarget(t testing.TB, handle func(net.Conn)) string {
+	t.Helper()
+	listener, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("listen WAN target: %v", err)
+	}
+	t.Cleanup(func() { _ = listener.Close() })
+
+	go func() {
+		for {
+			conn, err := listener.Accept()
+			if err != nil {
+				return
+			}
+			go func() {
+				defer conn.Close()
+				handle(conn)
+			}()
+		}
+	}()
+	return listener.Addr().String()
 }
 
 type wanMuxHarness struct {

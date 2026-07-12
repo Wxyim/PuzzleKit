@@ -38,6 +38,7 @@ import (
 const (
 	tunnelEarlyDataQueryKey   = "ed"
 	tunnelEarlyDataHeader     = "X-Sudoku-Early"
+	tunnelStreamEOFHeader     = "X-Sudoku-Stream-EOF"
 	tunnelPreconnectCount     = 3
 	tunnelMuxPreconnectCount  = tunnelPreconnectCount + 1
 	tunnelTLSHandshakeTimeout = 10 * time.Second
@@ -447,28 +448,58 @@ func dialSession(ctx context.Context, serverAddress string, opts TunnelDialOptio
 	}, nil
 }
 
-func bestEffortCloseSession(client *http.Client, closeURL, headerHost string, mode TunnelMode, auth *tunnelAuth) {
-	if client == nil || closeURL == "" || headerHost == "" {
-		return
+func sendSessionControl(client *http.Client, controlURL, headerHost string, mode TunnelMode, auth *tunnelAuth) error {
+	const maxAttempts = 3
+
+	if client == nil {
+		return errors.New("session control client is nil")
+	}
+	if controlURL == "" || headerHost == "" {
+		return errors.New("session control endpoint is empty")
 	}
 
 	closeCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 
-	req, err := http.NewRequestWithContext(closeCtx, http.MethodPost, closeURL, nil)
-	if err != nil {
-		return
-	}
-	req.Host = headerHost
-	applyTunnelHeaders(req.Header, headerHost, mode)
-	applyTunnelAuth(req, auth, mode, http.MethodPost, "/api/v1/upload")
+	var lastErr error
+	for attempt := 0; attempt < maxAttempts; attempt++ {
+		req, err := http.NewRequestWithContext(closeCtx, http.MethodPost, controlURL, nil)
+		if err != nil {
+			return err
+		}
+		req.Host = headerHost
+		applyTunnelHeaders(req.Header, headerHost, mode)
+		applyTunnelAuth(req, auth, mode, http.MethodPost, "/api/v1/upload")
 
-	resp, err := client.Do(req)
-	if err != nil || resp == nil {
-		return
+		resp, err := client.Do(req)
+		if err != nil {
+			lastErr = err
+			if closeCtx.Err() == nil && (isDialError(err) || isRetryableHTTPTransportError(err)) {
+				continue
+			}
+			return err
+		}
+		if resp == nil {
+			lastErr = io.ErrUnexpectedEOF
+			continue
+		}
+		_, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, 4*1024))
+		_ = resp.Body.Close()
+		if resp.StatusCode != http.StatusOK {
+			if attempt > 0 && (resp.StatusCode == http.StatusForbidden ||
+				resp.StatusCode == http.StatusNotFound ||
+				resp.StatusCode == http.StatusGone) {
+				return nil
+			}
+			return fmt.Errorf("session control bad status: %s", resp.Status)
+		}
+		return nil
 	}
-	_, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, 4*1024))
-	_ = resp.Body.Close()
+	return lastErr
+}
+
+func bestEffortCloseSession(client *http.Client, closeURL, headerHost string, mode TunnelMode, auth *tunnelAuth) {
+	_ = sendSessionControl(client, closeURL, headerHost, mode, auth)
 }
 
 func normalizeHTTPDialTarget(serverAddress string, tlsEnabled bool, hostOverride string) (scheme, urlHost, dialAddr, serverName string, err error) {

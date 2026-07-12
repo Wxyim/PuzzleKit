@@ -34,8 +34,11 @@ import (
 	"strings"
 	"sync"
 	"sync/atomic"
+	"syscall"
 	"testing"
 	"time"
+
+	"github.com/SUDOKU-ASCII/sudoku/pkg/connutil"
 )
 
 const (
@@ -48,6 +51,12 @@ type connectionThreshold struct {
 	count  atomic.Int32
 	once   sync.Once
 	ready  chan struct{}
+}
+
+type roundTripFunc func(*http.Request) (*http.Response, error)
+
+func (f roundTripFunc) RoundTrip(req *http.Request) (*http.Response, error) {
+	return f(req)
 }
 
 func newConnectionThreshold(target int) *connectionThreshold {
@@ -236,6 +245,198 @@ func TestPreparedConnPool_DoesNotReturnExpiredConnection(t *testing.T) {
 	}
 }
 
+func TestQueuedConn_ReadEOFDrainsBufferedPayload(t *testing.T) {
+	conn := &queuedConn{
+		rxc:     make(chan []byte, 1),
+		closed:  make(chan struct{}),
+		readEOF: make(chan struct{}),
+	}
+	conn.rxc <- []byte("final payload")
+	conn.markReadEOF()
+
+	got := make([]byte, len("final payload"))
+	if _, err := io.ReadFull(conn, got); err != nil {
+		t.Fatalf("read final payload: %v", err)
+	}
+	if string(got) != "final payload" {
+		t.Fatalf("final payload = %q", got)
+	}
+	var one [1]byte
+	if n, err := conn.Read(one[:]); n != 0 || !errors.Is(err, io.EOF) {
+		t.Fatalf("read after final payload = (%d, %v), want EOF", n, err)
+	}
+}
+
+func TestRetryableHTTPTransportError_TransportEOF(t *testing.T) {
+	for _, err := range []error{
+		io.EOF,
+		io.ErrUnexpectedEOF,
+		&url.Error{Op: "Get", URL: "http://example/stream", Err: io.EOF},
+		syscall.ECONNRESET,
+	} {
+		if !isRetryableHTTPTransportError(err) {
+			t.Fatalf("%T %v was not retryable", err, err)
+		}
+	}
+	for _, err := range []error{context.Canceled, context.DeadlineExceeded, errors.New("bad response")} {
+		if isRetryableHTTPTransportError(err) {
+			t.Fatalf("%T %v was retryable", err, err)
+		}
+	}
+}
+
+func TestSendSessionControl_RetriesTransportEOF(t *testing.T) {
+	var calls atomic.Int32
+	client := &http.Client{Transport: roundTripFunc(func(req *http.Request) (*http.Response, error) {
+		if req.Method != http.MethodPost || req.URL.Query().Get("fin") != "1" {
+			t.Fatalf("unexpected control request: %s %s", req.Method, req.URL)
+		}
+		if calls.Add(1) == 1 {
+			return nil, io.EOF
+		}
+		return &http.Response{
+			StatusCode: http.StatusOK,
+			Status:     "200 OK",
+			Body:       io.NopCloser(strings.NewReader("OK")),
+			Header:     make(http.Header),
+		}, nil
+	})}
+
+	err := sendSessionControl(
+		client,
+		"http://example/api/v1/upload?token=session&fin=1",
+		"example",
+		TunnelModeStream,
+		newTunnelAuth("", 0),
+	)
+	if err != nil {
+		t.Fatalf("send session control: %v", err)
+	}
+	if calls.Load() != 2 {
+		t.Fatalf("control calls = %d, want 2", calls.Load())
+	}
+}
+
+func TestTunnelServer_SessionControlIsIdempotent(t *testing.T) {
+	for _, mode := range []TunnelMode{TunnelModeStream, TunnelModePoll} {
+		for _, control := range []string{"fin", "close"} {
+			t.Run(string(mode)+"/"+control, func(t *testing.T) {
+				srv := NewTunnelServer(TunnelServerOptions{
+					Mode:                "auto",
+					AuthKey:             compatAuthKey,
+					PassThroughOnReject: true,
+					PullReadTimeout:     50 * time.Millisecond,
+					SessionTTL:          time.Second,
+				})
+				client, server := net.Pipe()
+				defer client.Close()
+
+				done := make(chan struct{})
+				var (
+					result HandleResult
+					err    error
+				)
+				go func() {
+					result, _, err = srv.HandleConn(server)
+					close(done)
+				}()
+
+				path := "/api/v1/upload"
+				auth := newTunnelAuth(compatAuthKey, 0)
+				authValue := auth.token(mode, http.MethodPost, path, time.Now())
+				request := fmt.Sprintf(
+					"POST %s?token=already-closed&%s=1 HTTP/1.1\r\n"+
+						"Host: example.com\r\n"+
+						"X-Sudoku-Tunnel: %s\r\n"+
+						"Authorization: Bearer %s\r\n"+
+						"Content-Length: 0\r\n\r\n",
+					path, control, mode, authValue,
+				)
+				if _, err := io.WriteString(client, request); err != nil {
+					t.Fatalf("write control request: %v", err)
+				}
+				response, readErr := io.ReadAll(client)
+				if readErr != nil {
+					t.Fatalf("read control response: %v", readErr)
+				}
+				<-done
+				if err != nil {
+					t.Fatalf("handle control request: %v", err)
+				}
+				if result != HandleDone {
+					t.Fatalf("control result = %v, want HandleDone", result)
+				}
+				if !bytes.Contains(response, []byte("HTTP/1.1 200 OK")) {
+					t.Fatalf("control response = %q", response)
+				}
+			})
+		}
+	}
+}
+
+func TestRetryDial_DoesNotRetryAmbiguousTransportEOF(t *testing.T) {
+	closed := make(chan struct{})
+	var calls atomic.Int32
+	err := retryDial(closed, nil, 3, time.Millisecond, time.Millisecond, func() error {
+		calls.Add(1)
+		return io.EOF
+	})
+	if !errors.Is(err, io.EOF) {
+		t.Fatalf("retryDial error = %v, want EOF", err)
+	}
+	if calls.Load() != 1 {
+		t.Fatalf("ambiguous request attempts = %d, want 1", calls.Load())
+	}
+}
+
+func TestStreamSplitPull_RetriesTransportEOF(t *testing.T) {
+	var calls atomic.Int32
+	trailer := make(http.Header)
+	trailer.Set(tunnelStreamEOFHeader, "1")
+	client := &http.Client{Transport: roundTripFunc(func(*http.Request) (*http.Response, error) {
+		if calls.Add(1) == 1 {
+			return nil, io.EOF
+		}
+		return &http.Response{
+			StatusCode: http.StatusOK,
+			Status:     "200 OK",
+			Body:       io.NopCloser(bytes.NewReader([]byte("reply"))),
+			Header:     make(http.Header),
+			Trailer:    trailer,
+		}, nil
+	})}
+	ctx, cancel := context.WithCancel(context.Background())
+	conn := &streamSplitConn{
+		ctx:        ctx,
+		cancel:     cancel,
+		client:     client,
+		pullURL:    "http://example/stream",
+		headerHost: "example",
+		auth:       newTunnelAuth("", 0),
+		readiness:  newTunnelReadiness(),
+		queuedConn: queuedConn{
+			rxc:         make(chan []byte, queuedConnPayloadQueueDepth),
+			closed:      make(chan struct{}),
+			writeCh:     make(chan []byte, queuedConnPayloadQueueDepth),
+			writeClosed: make(chan struct{}),
+			readEOF:     make(chan struct{}),
+		},
+	}
+	t.Cleanup(func() { _ = conn.Close() })
+	go conn.pullLoop()
+
+	got, err := io.ReadAll(conn)
+	if err != nil {
+		t.Fatalf("read retried pull: %v", err)
+	}
+	if string(got) != "reply" {
+		t.Fatalf("retried pull = %q", got)
+	}
+	if calls.Load() != 2 {
+		t.Fatalf("pull calls = %d, want 2", calls.Load())
+	}
+}
+
 func TestDialTunnel_BidirectionalSmoke(t *testing.T) {
 	for _, mode := range []string{"stream", "poll", "ws", "auto"} {
 		t.Run(mode, func(t *testing.T) {
@@ -266,6 +467,150 @@ func TestDialTunnel_BidirectionalSmoke(t *testing.T) {
 			server := waitForTunnelConn(t, tunnelCh)
 			defer server.Close()
 			assertBidirectionalExchange(t, client, server)
+		})
+	}
+}
+
+func TestDialTunnel_HalfCloseDelayedResponse(t *testing.T) {
+	for _, mode := range []string{"stream", "poll", "auto"} {
+		t.Run(mode, func(t *testing.T) {
+			srv := NewTunnelServer(TunnelServerOptions{
+				Mode:            "auto",
+				PathRoot:        compatPathRoot,
+				AuthKey:         compatAuthKey,
+				PullReadTimeout: 50 * time.Millisecond,
+				SessionTTL:      3 * time.Second,
+			})
+			addr, stop, tunnelCh := startRawTunnelServer(t, srv)
+			defer stop()
+
+			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+			defer cancel()
+			client, err := DialTunnel(ctx, addr, TunnelDialOptions{
+				Mode:      mode,
+				PathRoot:  compatPathRoot,
+				AuthKey:   compatAuthKey,
+				Multiplex: "auto",
+			})
+			if err != nil {
+				t.Fatalf("dial %s: %v", mode, err)
+			}
+			defer client.Close()
+
+			server := waitForTunnelConn(t, tunnelCh)
+			defer server.Close()
+			serverDone := make(chan error, 1)
+			go func() {
+				request, err := io.ReadAll(server)
+				if err != nil {
+					serverDone <- err
+					return
+				}
+				time.Sleep(20 * time.Millisecond)
+				if _, err := server.Write(append([]byte("response:"), request...)); err != nil {
+					serverDone <- err
+					return
+				}
+				serverDone <- connutil.TryCloseWrite(server)
+			}()
+
+			if _, err := client.Write([]byte("request")); err != nil {
+				t.Fatalf("write request: %v", err)
+			}
+			if err := connutil.TryCloseWrite(client); err != nil {
+				t.Fatalf("close request: %v", err)
+			}
+			response, err := io.ReadAll(client)
+			if err != nil {
+				t.Fatalf("read delayed response: %v", err)
+			}
+			if string(response) != "response:request" {
+				t.Fatalf("response = %q", response)
+			}
+			if err := <-serverDone; err != nil {
+				t.Fatalf("server exchange: %v", err)
+			}
+		})
+	}
+}
+
+func TestDialTunnel_DownlinkHalfCloseKeepsUplink(t *testing.T) {
+	for _, mode := range []string{"stream", "poll", "auto"} {
+		t.Run(mode, func(t *testing.T) {
+			srv := NewTunnelServer(TunnelServerOptions{
+				Mode:            "auto",
+				PathRoot:        compatPathRoot,
+				AuthKey:         compatAuthKey,
+				PullReadTimeout: 50 * time.Millisecond,
+				SessionTTL:      3 * time.Second,
+			})
+			addr, stop, tunnelCh := startRawTunnelServer(t, srv)
+			defer stop()
+
+			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+			defer cancel()
+			client, err := DialTunnel(ctx, addr, TunnelDialOptions{
+				Mode:      mode,
+				PathRoot:  compatPathRoot,
+				AuthKey:   compatAuthKey,
+				Multiplex: "auto",
+			})
+			if err != nil {
+				t.Fatalf("dial %s: %v", mode, err)
+			}
+			defer client.Close()
+
+			server := waitForTunnelConn(t, tunnelCh)
+			defer server.Close()
+			type halfCloseResult struct {
+				tail []byte
+				err  error
+			}
+			serverDone := make(chan halfCloseResult, 1)
+			go func() {
+				if _, err := server.Write([]byte("response")); err != nil {
+					serverDone <- halfCloseResult{err: err}
+					return
+				}
+				if err := connutil.TryCloseWrite(server); err != nil {
+					serverDone <- halfCloseResult{err: err}
+					return
+				}
+				tail, err := io.ReadAll(server)
+				serverDone <- halfCloseResult{tail: tail, err: err}
+			}()
+
+			response, err := io.ReadAll(client)
+			if err != nil {
+				t.Fatalf("read response: %v", err)
+			}
+			if string(response) != "response" {
+				t.Fatalf("response = %q", response)
+			}
+			if _, err := client.Write([]byte("tail")); err != nil {
+				t.Fatalf("write tail after EOF: %v", err)
+			}
+			if err := connutil.TryCloseWrite(client); err != nil {
+				t.Fatalf("close tail: %v", err)
+			}
+
+			select {
+			case result := <-serverDone:
+				if result.err != nil {
+					t.Fatalf("server read tail: %v", result.err)
+				}
+				if string(result.tail) != "tail" {
+					t.Fatalf("server tail = %q", result.tail)
+				}
+			case <-time.After(5 * time.Second):
+				t.Fatal("server did not receive tail")
+			}
+			srv.mu.Lock()
+			sessionCount := len(srv.sessions)
+			srv.mu.Unlock()
+			if sessionCount != 0 {
+				t.Fatalf("sessions after both directions closed = %d, want 0", sessionCount)
+			}
 		})
 	}
 }
