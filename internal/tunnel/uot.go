@@ -117,23 +117,21 @@ func HandleUoTServerWithDialer(conn net.Conn, dial func(addr string) (net.Conn, 
 		return fmt.Errorf("nil conn")
 	}
 
-	pConn, err := net.ListenPacket("udp", "")
-	if err != nil {
-		return fmt.Errorf("listen udp for uot: %w", err)
-	}
-
 	errCh := make(chan error, 1)
 	var once sync.Once
 
-	closeAll := func(err error) {
-		once.Do(func() {
-			_ = conn.Close()
-			_ = pConn.Close()
-			errCh <- err
-		})
-	}
-
 	if dial == nil {
+		pConn, err := net.ListenPacket("udp", "")
+		if err != nil {
+			return fmt.Errorf("listen udp for uot: %w", err)
+		}
+		closeAll := func(err error) {
+			once.Do(func() {
+				_ = conn.Close()
+				_ = pConn.Close()
+				errCh <- err
+			})
+		}
 		go func() {
 			buf := make([]byte, maxUoTPayload)
 			for {
@@ -172,7 +170,19 @@ func HandleUoTServerWithDialer(conn net.Conn, dial func(addr string) (net.Conn, 
 	}
 
 	var mu sync.Mutex
+	var writeMu sync.Mutex
 	conns := make(map[string]net.Conn)
+	closeAll := func(err error) {
+		once.Do(func() {
+			mu.Lock()
+			for _, c := range conns {
+				_ = c.Close()
+			}
+			mu.Unlock()
+			_ = conn.Close()
+			errCh <- err
+		})
+	}
 
 	go func() {
 		for {
@@ -206,23 +216,28 @@ func HandleUoTServerWithDialer(conn net.Conn, dial func(addr string) (net.Conn, 
 						if n == 0 {
 							continue
 						}
-						if err := WriteUoTDatagram(conn, target, buf[:n]); err != nil {
+						writeMu.Lock()
+						writeErr := WriteUoTDatagram(conn, target, buf[:n])
+						writeMu.Unlock()
+						if writeErr != nil {
 							mu.Lock()
 							delete(conns, target)
 							mu.Unlock()
-							closeAll(err)
+							closeAll(writeErr)
 							return
 						}
 					}
 				}(addrStr, udpConn)
 			}
 
+			mu.Unlock()
 			if _, err := udpConn.Write(payload); err != nil {
-				mu.Unlock()
 				_ = udpConn.Close()
+				mu.Lock()
+				delete(conns, addrStr)
+				mu.Unlock()
 				continue
 			}
-			mu.Unlock()
 		}
 	}()
 

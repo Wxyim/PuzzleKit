@@ -245,14 +245,15 @@ func handleSudokuServerConn(handshakeConn net.Conn, rawConn net.Conn, cfg *confi
 	case tunnel.KIPTypeStartUoT:
 		logUserInfo("Server/UoT", userHash, "session start")
 
-		dialTarget, err := newServerDialTarget(cfg, nil, "udp")
-		if err != nil {
-			logx.Warnf("Server/UoT", "Outbound setup failed: %v", err)
-			return
+		var uotErr error
+		if cfg.Proxy == nil || strings.TrimSpace(cfg.Proxy.Address) == "" {
+			// Preserve the original single-socket UoT path for direct outbound traffic.
+			uotErr = tunnel.HandleUoTServer(tunnelConn)
+		} else {
+			uotErr = tunnel.HandleUoTServerWithDialer(tunnelConn, newSOCKS5UDPDialer(cfg.Proxy))
 		}
-
-		if err := tunnel.HandleUoTServerWithDialer(tunnelConn, dialTarget); err != nil {
-			logUserWarn("Server/UoT", userHash, "session end: %v", err)
+		if uotErr != nil {
+			logUserWarn("Server/UoT", userHash, "session end: %v", uotErr)
 		} else {
 			logUserInfo("Server/UoT", userHash, "session end")
 		}
